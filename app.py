@@ -1350,6 +1350,108 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         mime="text/csv",
     )
 
+    # ── Drill-Down: select a dimension value and break it by a secondary dim ──
+    st.markdown("---")
+    st.markdown(f"### Drill-Down: {selected_label} → Secondary Breakdown")
+
+    _type_col = col_map.get("Type of Break")
+    _secondary_opts = {}
+    for _lbl, _col in {
+        "Team":          team_col,
+        "Rec Name":      rec_col,
+        "Entity":        entity_col,
+        "Asset Class":   ac_col,
+        "Type of Break": _type_col,
+        "True/Systemic": ts_col,
+    }.items():
+        if _col and _col != dim_col and _col in _summary_src.columns:
+            _secondary_opts[_lbl] = _col
+
+    if not _secondary_opts:
+        st.info("No secondary breakdown columns available for the current dimension.")
+    else:
+        _dim_vals = sorted(
+            v for v in _summary_src[dim_col].dropna().astype(str).unique()
+            if v not in ("", "nan", "None", "N/A", "-")
+        )
+        if not _dim_vals:
+            st.info("No values found to drill into.")
+        else:
+            dd1, dd2, dd3 = st.columns([3, 2, 2])
+            with dd1:
+                _sel_val = st.selectbox(
+                    f"Select {selected_label}:",
+                    _dim_vals, key="jira_drill_val",
+                )
+            with dd2:
+                _drill_dim_lbl = st.selectbox(
+                    "Breakdown by", list(_secondary_opts.keys()),
+                    key="jira_drill_dim",
+                )
+            with dd3:
+                _drill_metric = st.radio(
+                    "Metric", ["Count", "ABS GBP"], horizontal=True,
+                    key="jira_drill_metric",
+                )
+
+            _drill_dim_col = _secondary_opts[_drill_dim_lbl]
+            _drill_src = _summary_src[
+                _summary_src[dim_col].astype(str) == _sel_val
+            ].copy()
+
+            if len(_drill_src) == 0:
+                st.info(f"No data found for {selected_label} = {_sel_val}.")
+            else:
+                st.markdown(
+                    f'<div class="banner-drill">🔬 Drilling into: <b>{_sel_val}</b> '
+                    f'— breakdown by <b>{_drill_dim_lbl}</b></div>',
+                    unsafe_allow_html=True,
+                )
+                _fig_dd = None
+                if _drill_metric == "Count":
+                    _drill_trend = dq_local(
+                        f'SELECT "_Period_label", "{_drill_dim_col}", COUNT(*) AS cnt '
+                        f'FROM tbl WHERE "_Period_label" IS NOT NULL '
+                        f'GROUP BY "_Period_label", "{_drill_dim_col}" '
+                        f'ORDER BY "_Period_label"',
+                        tbl=_drill_src,
+                    )
+                    _fig_dd = px.bar(
+                        _drill_trend, x="_Period_label", y="cnt",
+                        color=_drill_dim_col,
+                        color_discrete_sequence=COLORS, barmode="stack",
+                    )
+                    _fig_dd = chart_layout(
+                        _fig_dd,
+                        f"{_sel_val} — Breaks by Period × {_drill_dim_lbl}",
+                        "Period", "Break Count", height=420,
+                    )
+                else:
+                    if abs_col and abs_col in _drill_src.columns:
+                        _drill_trend = dq_local(
+                            f'SELECT "_Period_label", "{_drill_dim_col}", '
+                            f'SUM(ABS("{abs_col}")) AS total_abs '
+                            f'FROM tbl WHERE "_Period_label" IS NOT NULL '
+                            f'GROUP BY "_Period_label", "{_drill_dim_col}" '
+                            f'ORDER BY "_Period_label"',
+                            tbl=_drill_src,
+                        )
+                        _fig_dd = px.bar(
+                            _drill_trend, x="_Period_label", y="total_abs",
+                            color=_drill_dim_col,
+                            color_discrete_sequence=COLORS, barmode="stack",
+                        )
+                        _fig_dd = chart_layout(
+                            _fig_dd,
+                            f"{_sel_val} — ABS GBP by Period × {_drill_dim_lbl}",
+                            "Period", "ABS GBP (£)", height=420,
+                        )
+                    else:
+                        st.info("No ABS GBP column available for Amount metric.")
+
+                if _fig_dd is not None:
+                    st.plotly_chart(_fig_dd, use_container_width=True)
+
     st.markdown("---")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1512,20 +1614,20 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     # ─────────────────────────────────────────────────────────────────────
     # Trend over periods — Top 5, legend annotated with Jira Desc
     # ─────────────────────────────────────────────────────────────────────
-    if "_Period_label" in df.columns and period_order:
+    if "_Period_label" in _summary_src.columns and period_order:
         st.markdown(f"### {selected_label} — Break Count Trend Over Periods (Top 5)")
         top5 = dq(f"""
             SELECT "{dim_col}" AS factor FROM tbl
             WHERE "{dim_col}" IS NOT NULL
               AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
             GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
-        """, df)["factor"].tolist()
+        """, _summary_src)["factor"].tolist()
         top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
         trend_df = dq(f"""
             SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
             FROM tbl WHERE "{dim_col}" IN ({top5_str})
             GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
-        """, df)
+        """, _summary_src)
         if dmap:
             trend_df["factor_label"] = trend_df["factor"].apply(
                 lambda x: _short_label(x, dmap, max_chars=40))
@@ -1552,7 +1654,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
               AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
             GROUP BY "{dim_col}"
             HAVING (lat > 0 OR prv > 0)
-        """, df)
+        """, _summary_src)
         mom_df["delta"] = mom_df["lat"] - mom_df["prv"]
         mom_df = mom_df.sort_values("delta")
         colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["delta"]]
