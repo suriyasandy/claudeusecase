@@ -750,62 +750,20 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
         st.info("No period data available.")
         return
 
-    # ── Historical Comparison expander ──────────────────────────────────────
-    if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
-        with st.expander("📊 Historical Comparison — Break Count Trend", expanded=False):
-            curr_periods = sorted(df_f["_Period_label"].dropna().unique().tolist())
-            hist_periods = sorted(hist_df["_Period_label"].dropna().unique().tolist())
-
-            # KPI cards: latest vs historical average
-            n_curr = len(df_f[df_f["_Period_label"] == curr_periods[-1]]) if curr_periods else len(df_f)
-            n_hist_avg = len(hist_df) / max(len(hist_periods), 1)
-            delta_pct = safe_mom_pct(n_curr, n_hist_avg)
-
-            hc1, hc2, hc3 = st.columns(3)
-            with hc1:
-                kpi_card("Latest Period Breaks", format_number(n_curr),
-                         f"Period: {curr_periods[-1] if curr_periods else 'N/A'}")
-            with hc2:
-                kpi_card("Historical Avg Breaks", format_number(round(n_hist_avg)),
-                         f"Over {len(hist_periods)} historical period(s)")
-            with hc3:
-                warn = delta_pct is not None and delta_pct > 15
-                kpi_card("Change vs Hist Avg",
-                         f"{delta_pct:+.1f}%" if delta_pct is not None else "N/A",
-                         "vs historical average", invert=True, warn=warn)
-
-            # Build combined period counts: historical (grey) + current (teal)
-            hist_counts = (
-                hist_df.groupby("_Period_label").size()
-                .reset_index(name="Count")
-                .assign(Source="Historical")
-            )
-            curr_counts = (
-                df_f.groupby("_Period_label").size()
-                .reset_index(name="Count")
-                .assign(Source="Current")
-            )
-            combined = pd.concat([hist_counts, curr_counts], ignore_index=True)
-            combined = combined.sort_values("_Period_label")
-
-            fig_hist = px.bar(
-                combined, x="_Period_label", y="Count", color="Source",
-                color_discrete_map={"Historical": "#AAAAAA", "Current": PRIMARY},
-                barmode="group",
-                text="Count",
-            )
-            fig_hist.update_traces(textposition="outside", texttemplate="%{text:,}")
-            fig_hist = chart_layout(fig_hist,
-                "Break Count — Current vs Historical Periods",
-                "Period", "Break Count", height=380)
-            st.plotly_chart(fig_hist, use_container_width=True)
-
-        st.markdown("")
-
     # Top-10 Rec Names trend
     if rec_actual and rec_actual in df_f.columns:
-        top10_series = df_f[rec_actual].value_counts().head(10).index.tolist()
-        top10_df = df_f[df_f[rec_actual].isin(top10_series)]
+        # Combine hist + current so trend spans all available periods
+        _trend_cols = [rec_actual, "_Period_label"]
+        if (hist_df is not None and len(hist_df) > 0
+                and "_Period_label" in hist_df.columns
+                and rec_actual in hist_df.columns):
+            _trend_src = pd.concat(
+                [hist_df[_trend_cols], df_f[_trend_cols]], ignore_index=True
+            )
+        else:
+            _trend_src = df_f[_trend_cols]
+        top10_series = _trend_src[rec_actual].value_counts().head(10).index.tolist()
+        top10_df = _trend_src[_trend_src[rec_actual].isin(top10_series)]
         trend = (
             top10_df.groupby(["_Period_label", rec_actual])
             .size()
@@ -993,65 +951,6 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     with k4:
         kpi_card("Total Breaks", format_number(len(df_f)))
 
-    # ── Historical Comparison expander ──────────────────────────────────────
-    if (hist_df is not None and len(hist_df) > 0
-            and "_Period_label" in hist_df.columns
-            and amt_col in hist_df.columns):
-        with st.expander("📊 Historical Comparison — Amount Trend", expanded=False):
-            curr_periods = sorted(df_f["_Period_label"].dropna().unique().tolist()) if "_Period_label" in df_f.columns else []
-            hist_periods = sorted(hist_df["_Period_label"].dropna().unique().tolist())
-
-            curr_amt_total = float(df_f[amt_col].abs().sum())
-            hist_amt_avg   = float(hist_df[amt_col].abs().sum()) / max(len(hist_periods), 1)
-            delta_pct = safe_mom_pct(curr_amt_total, hist_amt_avg)
-
-            ha1, ha2, ha3 = st.columns(3)
-            with ha1:
-                kpi_card("Current Total ABS (£)", format_short(curr_amt_total))
-            with ha2:
-                kpi_card("Historical Avg ABS (£)", format_short(hist_amt_avg),
-                         f"Over {len(hist_periods)} period(s)")
-            with ha3:
-                warn = delta_pct is not None and delta_pct > 20
-                kpi_card("Change vs Hist Avg",
-                         f"{delta_pct:+.1f}%" if delta_pct is not None else "N/A",
-                         "vs historical average", invert=True, warn=warn)
-
-            # Combined amount trend chart
-            hist_amt_by_period = (
-                hist_df.groupby("_Period_label")[amt_col]
-                .apply(lambda x: x.abs().sum()).reset_index()
-                .assign(Source="Historical")
-            )
-            hist_amt_by_period.columns = ["_Period_label", "Total ABS (£)", "Source"]
-
-            curr_amt_by_period = (
-                df_f.groupby("_Period_label")[amt_col]
-                .apply(lambda x: x.abs().sum()).reset_index()
-                .assign(Source="Current")
-            ) if "_Period_label" in df_f.columns else pd.DataFrame()
-            if not curr_amt_by_period.empty:
-                curr_amt_by_period.columns = ["_Period_label", "Total ABS (£)", "Source"]
-
-            combined_amt = pd.concat(
-                [d for d in [hist_amt_by_period, curr_amt_by_period] if not d.empty],
-                ignore_index=True,
-            ).sort_values("_Period_label")
-
-            fig_ha = px.bar(
-                combined_amt, x="_Period_label", y="Total ABS (£)", color="Source",
-                color_discrete_map={"Historical": "#AAAAAA", "Current": PRIMARY},
-                barmode="group",
-                text=combined_amt["Total ABS (£)"].apply(format_short),
-            )
-            fig_ha.update_traces(textposition="outside")
-            fig_ha = chart_layout(fig_ha,
-                "Total ABS Amount (£) — Current vs Historical Periods",
-                "Period", "ABS GBP (£)", height=380)
-            st.plotly_chart(fig_ha, use_container_width=True)
-
-        st.markdown("")
-
     st.markdown("---")
 
     # ── Chart view toggle ─────────────────────────────────────────────────────
@@ -1066,10 +965,20 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     _amt_view = st.radio("View", _view_opts, horizontal=True, key="_amt_view")
 
     if _amt_view == "By Period" and "_Period_label" in df_f.columns:
+        # Merge historical periods so the chart shows full trend
+        if (hist_df is not None and len(hist_df) > 0
+                and "_Period_label" in hist_df.columns
+                and amt_col in hist_df.columns):
+            _period_src = pd.concat(
+                [hist_df[["_Period_label", amt_col]],
+                 df_f[["_Period_label", amt_col]]], ignore_index=True
+            )
+        else:
+            _period_src = df_f[["_Period_label", amt_col]]
         period_amt = dq_local(
             f'SELECT "_Period_label", SUM({safe_amt(amt_col)}) AS total_amt '
             f'FROM tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-            tbl=df_f
+            tbl=_period_src
         )
         fig = px.bar(
             period_amt, x="_Period_label", y="total_amt",
@@ -1217,8 +1126,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     )
     dim_col = all_dims[selected_label]
 
-    period_order = (sorted(df["_Period_label"].dropna().unique().tolist())
-                    if "_Period_label" in df.columns else [])
+    # Determine period order from combined current + historical data
+    _period_sources = [df] if "_Period_label" in df.columns else []
+    if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
+        _period_sources.append(hist_df[["_Period_label"]])
+    if _period_sources:
+        _combined_periods = pd.concat(_period_sources, ignore_index=True)
+        period_order = sorted(_combined_periods["_Period_label"].dropna().unique().tolist())
+    else:
+        period_order = []
     latest = period_order[-1] if period_order else "0"
     prev   = period_order[-2] if len(period_order) >= 2 else "0"
 
@@ -1282,6 +1198,12 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         '0 AS "Latest Period", 0 AS "Prev Period"'
     )
 
+    # Build combined source for summary: include hist data so Prev Period / Latest are populated
+    if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
+        _summary_src = pd.concat([hist_df, df], ignore_index=True)
+    else:
+        _summary_src = df
+
     summary_df = dq(f"""
         SELECT
             "{dim_col}"  AS "{selected_label}",
@@ -1296,7 +1218,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
           AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
         GROUP BY "{dim_col}"
         ORDER BY "Break Count" DESC
-    """, df)
+    """, _summary_src)
 
     # ── Derived / enriched columns ──
     if "Total ABS GBP" in summary_df.columns:
@@ -1665,55 +1587,6 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
-
-    # ── Historical Comparison expander ──────────────────────────────────────
-    if (hist_df is not None and len(hist_df) > 0
-            and "_Period_label" in hist_df.columns
-            and dim_col in hist_df.columns):
-        with st.expander("📊 Historical Comparison — Top Factors Trend", expanded=False):
-            hist_periods = sorted(hist_df["_Period_label"].dropna().unique().tolist())
-            curr_periods = period_order
-
-            # Top 5 factors by break count in current data
-            top5_hist = dq(f"""
-                SELECT "{dim_col}" AS factor FROM tbl
-                WHERE "{dim_col}" IS NOT NULL
-                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-                GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
-            """, df)["factor"].tolist()
-
-            if top5_hist:
-                top5_str_h = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5_hist)
-
-                # Current period counts per factor
-                curr_trend = dq(f"""
-                    SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
-                    FROM tbl WHERE "{dim_col}" IN ({top5_str_h})
-                    GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
-                """, df).assign(Source="Current")
-
-                # Historical counts per factor
-                hist_trend = dq(f"""
-                    SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
-                    FROM tbl WHERE "{dim_col}" IN ({top5_str_h})
-                    GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
-                """, hist_df).assign(Source="Historical")
-
-                combined_trend = pd.concat([hist_trend, curr_trend], ignore_index=True)
-                combined_trend = combined_trend.sort_values("period")
-
-                fig_jh = px.line(
-                    combined_trend, x="period", y="cnt",
-                    color="factor", line_dash="Source",
-                    color_discrete_sequence=COLORS, markers=True,
-                )
-                fig_jh = chart_layout(fig_jh,
-                    f"Top 5 {selected_label} — Break Count: Historical + Current",
-                    "Period", "Break Count", height=400)
-                st.plotly_chart(fig_jh, use_container_width=True)
-                st.caption("Solid lines = Current periods   Dashed lines = Historical periods")
-            else:
-                st.info("No factor data available for historical comparison.")
 
 
 # ── Tab: FP Thresholding ──────────────────────────────────────────────────────
