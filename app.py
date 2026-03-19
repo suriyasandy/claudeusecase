@@ -53,7 +53,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
     HAS_AGGRID = True
 except ImportError:
     HAS_AGGRID = False
@@ -182,7 +182,7 @@ def chart_layout(fig, title: str, xlab: str = "", ylab: str = "", height: int = 
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=40, r=20, t=60, b=40),
     )
-    fig.update_xaxes(showgrid=False, linecolor="#E0E0E0")
+    fig.update_xaxes(showgrid=False, linecolor="#E0E0E0", type="category")
     fig.update_yaxes(showgrid=True, gridcolor="#F0F0F0", linecolor="#E0E0E0")
     return fig
 
@@ -203,7 +203,8 @@ def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
         gb.configure_default_column(resizable=True, sortable=True, filter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
-               allow_unsafe_jscode=True, theme="streamlit")
+               allow_unsafe_jscode=True, theme="streamlit",
+               update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(df, use_container_width=True, height=height)
 
@@ -641,7 +642,7 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
 
 # ── Tab: Ageing Validation ────────────────────────────────────────────────────
 
-def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict) -> None:
+def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
     st.markdown("## 📅 Ageing Validation")
 
     if "_Computed_Bucket" not in df_f.columns:
@@ -722,11 +723,18 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict) -> None:
         fig2 = chart_layout(fig2, "Age Bucket by Team", team_actual, "Count", height=400)
         st.plotly_chart(fig2, use_container_width=True)
 
-    # Period trend of ageing
-    if "_Period_label" in df_f.columns:
+    # Period trend of ageing — merge historical data if available
+    if "_Period_label" in df_f.columns and "_Computed_Age_Days" in df_f.columns:
         st.markdown("### Avg Age Days by Period")
+        _age_cols = ["_Period_label", "_Computed_Age_Days"]
+        if (hist_df is not None and len(hist_df) > 0
+                and "_Period_label" in hist_df.columns
+                and "_Computed_Age_Days" in hist_df.columns):
+            _age_src = pd.concat([hist_df[_age_cols], df_f[_age_cols]], ignore_index=True)
+        else:
+            _age_src = df_f[_age_cols]
         age_trend = (
-            df_f.groupby("_Period_label")["_Computed_Age_Days"]
+            _age_src.groupby("_Period_label")["_Computed_Age_Days"]
             .mean()
             .reset_index()
             .sort_values("_Period_label")
@@ -916,9 +924,16 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
 
                     st.markdown('</div>', unsafe_allow_html=True)
     else:
-        # No rec column — just show overall period trend
+        # No rec column — show overall period trend using hist+current data
         if "_Period_label" in df_f.columns:
-            period_cnt = df_f.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
+            if (hist_df is not None and len(hist_df) > 0
+                    and "_Period_label" in hist_df.columns):
+                _all_src = pd.concat(
+                    [hist_df[["_Period_label"]], df_f[["_Period_label"]]], ignore_index=True
+                )
+            else:
+                _all_src = df_f[["_Period_label"]]
+            period_cnt = _all_src.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
             fig = px.bar(period_cnt, x="_Period_label", y="Count", color_discrete_sequence=[PRIMARY])
             fig = chart_layout(fig, "Break Count by Period", "Period", "Count", height=380)
             st.plotly_chart(fig, use_container_width=True)
@@ -1191,12 +1206,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         'COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS ">365d",'
         if "_Computed_Age_Days" in df.columns else ""
     )
-    period_expr = (
-        f'COUNT(*) FILTER (WHERE _Period_label = \'{latest}\') AS "Latest Period",'
-        f'COUNT(*) FILTER (WHERE _Period_label = \'{prev}\')   AS "Prev Period"'
-        if period_order else
-        '0 AS "Latest Period", 0 AS "Prev Period"'
-    )
+    # Build one column per period so all historical + current periods are visible
+    if period_order:
+        _p_safe = lambda p: p.replace("'", "''")
+        period_expr = ",\n".join(
+            f'COUNT(*) FILTER (WHERE _Period_label = \'{_p_safe(p)}\') AS "{p}"'
+            for p in period_order
+        )
+    else:
+        period_expr = '0 AS "No Period"'
 
     # Build combined source for summary: include hist data so Prev Period / Latest are populated
     if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
@@ -1235,19 +1253,24 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             summary_df["Break Count"].replace(0, np.nan) * 100
         ).round(1)
 
-    if "Latest Period" in summary_df.columns and "Prev Period" in summary_df.columns:
-        summary_df["MoM Δ"]   = summary_df["Latest Period"] - summary_df["Prev Period"]
+    # MoM Δ uses the two most recent periods (latest vs previous)
+    if len(period_order) >= 2 and latest in summary_df.columns and prev in summary_df.columns:
+        summary_df["MoM Δ"]   = summary_df[latest] - summary_df[prev]
         summary_df["MoM Δ %"] = (
             (summary_df["MoM Δ"] /
-             summary_df["Prev Period"].replace(0, np.nan)) * 100
+             summary_df[prev].replace(0, np.nan)) * 100
         ).round(1)
 
-    # ── Column order — Jira Desc always immediately after Jira Reference ──
+    # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
     for c in ["Jira Description", "System to be Fixed", "Account Group",
               "Products Reconciled", "Unique Jira Refs"]:
         if c in summary_df.columns: col_order.append(c)
-    for c in ["Break Count", "Latest Period", "Prev Period", "MoM Δ", "MoM Δ %",
+    col_order.append("Break Count")
+    # All period columns in chronological order
+    for p in period_order:
+        if p in summary_df.columns: col_order.append(p)
+    for c in ["MoM Δ", "MoM Δ %",
               "Avg Age Days", "Max Age Days",
               ">90d", ">90 Day %", ">180d", ">365d",
               "Total ABS GBP", "Avg GBP / Break"]:
@@ -1273,9 +1296,9 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                                 tooltipField="Jira Description")
         if "System to be Fixed" in summary_df.columns:
             gb.configure_column("System to be Fixed", width=200)
-        for c in ["Break Count", "Latest Period", "Prev Period"]:
+        for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
-                gb.configure_column(c, width=120)
+                gb.configure_column(c, width=110)
         if "MoM Δ" in summary_df.columns:
             mom_cs = JsCode("""function(p){
                 var v=p.value;
@@ -1292,7 +1315,8 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
         AgGrid(summary_df, gridOptions=gb.build(), height=440,
-               theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid")
+               theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
+               update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(summary_df, height=440, use_container_width=True)
 
@@ -1591,140 +1615,176 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
 
 # ── Tab: FP Thresholding ──────────────────────────────────────────────────────
 
-def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict) -> None:
-    st.markdown("## 🎯 False Positive Thresholding")
+def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
+    st.markdown("## 🎯 Break Priority & False Positive Thresholding")
 
     st.markdown(
-        '<div class="banner-fp">🎯 Statistical FP detection: segments where the latest period '
-        'break count is within historical norms are flagged as False Positive candidates.</div>',
+        '<div class="banner-fp">🎯 Segments are ranked by ABS GBP amount against their '
+        'historical trend. High-priority = materially elevated above historical norms. '
+        'Low-priority / FP candidates = within historical norms (candidates for known Jira tagging).</div>',
         unsafe_allow_html=True)
 
-    if "_Period_label" not in df_f.columns:
-        st.info("No period data available for FP analysis.")
+    abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    if not abs_col:
+        st.info("No ABS GBP / Break Amount column found.")
         return
 
-    period_order = sorted(df_f["_Period_label"].dropna().unique().tolist())
+    # Combine hist + current so we have multiple periods
+    _need_cols = ["_Period_label", abs_col]
+    _src_frames = [df_f[[c for c in _need_cols if c in df_f.columns]]]
+    if (hist_df is not None and len(hist_df) > 0
+            and "_Period_label" in hist_df.columns
+            and abs_col in hist_df.columns):
+        _src_frames.append(hist_df[[c for c in _need_cols if c in hist_df.columns]])
+
+    # Add segment columns from whichever frame has them
+    seg_col_keys = ["Rec Name (as per Rec Cube)", "Team", "Entity", "Asset Class"]
+    seg_cols = [col_map[k] for k in seg_col_keys if k in col_map and col_map[k] in df_f.columns]
+    if not seg_cols:
+        st.info("No segment columns (Rec Name, Team, Entity, Asset Class) found for analysis.")
+        return
+
+    # Rebuild source frames with segment cols included
+    _all_cols = seg_cols + ["_Period_label", abs_col]
+    _src_frames = [df_f[[c for c in _all_cols if c in df_f.columns]]]
+    if (hist_df is not None and len(hist_df) > 0
+            and "_Period_label" in hist_df.columns
+            and abs_col in hist_df.columns):
+        _src_frames.append(hist_df[[c for c in _all_cols if c in hist_df.columns]])
+
+    combined = pd.concat(_src_frames, ignore_index=True)
+    if abs_col in combined.columns:
+        combined[abs_col] = combined[abs_col].abs()
+
+    period_order = sorted(combined["_Period_label"].dropna().unique().tolist())
     if len(period_order) < 2:
-        st.info("Need at least 2 periods for FP thresholding.")
+        st.info("Need at least 2 periods for thresholding. Upload a historical file or wait for the cache to accumulate a second period.")
         return
 
     latest_period = period_order[-1]
     hist_periods  = period_order[:-1]
 
-    # Segment columns
-    seg_col_keys = ["Rec Name (as per Rec Cube)", "Team", "Entity", "Asset Class"]
-    seg_cols = [col_map[k] for k in seg_col_keys if k in col_map and col_map[k] in df_f.columns]
-
-    if not seg_cols:
-        st.info("No segment columns found for FP analysis.")
-        return
-
-    # Sidebar controls
+    # ── Controls ──────────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
     with c1:
-        mad_k = st.slider("MAD multiplier (k)", 0.5, 5.0, 2.0, 0.5,
-                          help="Number of MADs from historical mean to flag as FP candidate")
+        seg_sel = st.selectbox(
+            "Primary Segment",
+            [col_map[k] for k in seg_col_keys if k in col_map and col_map[k] in combined.columns],
+            format_func=lambda c: next(
+                (k for k, v in col_map.items() if v == c), c),
+            key="_fp_seg_sel",
+            help="Group breaks by this dimension for priority ranking"
+        )
     with c2:
-        fp_thresh_pct = st.slider("Deviation % threshold", 5, 100, 30, 5,
-                                  help="Max % deviation from historical mean to flag as High confidence FP")
+        high_thresh = st.slider("High Priority threshold (%)", 20, 200, 50, 10,
+                                help="Segments where latest ABS GBP exceeds historical mean by this % → High Priority")
     with c3:
-        min_hist_count = st.slider("Min historical count", 1, 20, 3, 1,
-                                   help="Segments with historical mean below this are skipped")
+        med_thresh = st.slider("Medium Priority threshold (%)", 5, 100, 20, 5,
+                               help="Segments between medium and high thresholds → Medium Priority")
 
-    # Build pivot table: rows = segments, cols = periods, values = count
-    grp_cols = seg_cols + ["_Period_label"]
-    counts = df_f.groupby(grp_cols).size().reset_index(name="cnt")
-    pivot = counts.pivot_table(index=seg_cols, columns="_Period_label", values="cnt", fill_value=0)
+    # ── Build pivot: rows = segment values, cols = periods, values = sum ABS GBP ──
+    grp = combined.groupby([seg_sel, "_Period_label"])[abs_col].sum().reset_index()
+    pivot = grp.pivot_table(index=seg_sel, columns="_Period_label", values=abs_col, fill_value=0)
     pivot = pivot.reset_index()
-
-    # Ensure all periods present
     for p in period_order:
         if p not in pivot.columns:
-            pivot[p] = 0
-
-    # Vectorised FP computation (Change 9)
-    if len(pivot) == 0:
-        st.info("No segments meet the minimum history count.")
-        return
+            pivot[p] = 0.0
 
     hist_data   = pivot[hist_periods].values.astype(float)
     latest_data = pivot[latest_period].values.astype(float)
 
-    hist_mean_all = hist_data.mean(axis=1)
-    hist_mad_all  = np.median(np.abs(hist_data - hist_mean_all[:, None]), axis=1)
+    hist_mean = hist_data.mean(axis=1)
+    # % deviation of latest vs historical mean (signed: positive = elevated)
+    dev_pct = (latest_data - hist_mean) / np.maximum(hist_mean, 1) * 100
 
-    mask_min  = hist_mean_all >= min_hist_count
-    pivot     = pivot[mask_min].reset_index(drop=True)
-    hist_data = hist_data[mask_min]
-    hist_mean_all = hist_mean_all[mask_min]
-    hist_mad_all  = hist_mad_all[mask_min]
-    latest_data   = latest_data[mask_min]
+    pivot["Hist Avg ABS GBP"] = np.round(hist_mean, 0)
+    pivot["Latest ABS GBP"]   = np.round(latest_data, 0)
+    pivot["vs Hist Avg %"]    = np.round(dev_pct, 1)
 
-    if len(pivot) == 0:
-        st.info("No segments meet the minimum history count. Lower the Min historical count or upload more periods.")
-        return
+    # Trend direction: slope of linear fit across historical periods
+    if len(hist_periods) >= 2:
+        x = np.arange(len(hist_periods), dtype=float)
+        slopes = np.array([
+            np.polyfit(x, hist_data[i], 1)[0] if np.any(hist_data[i] > 0) else 0.0
+            for i in range(len(hist_data))
+        ])
+        pivot["Trend"] = np.where(slopes > 0, "↑ Rising", np.where(slopes < 0, "↓ Falling", "→ Stable"))
+    else:
+        pivot["Trend"] = "—"
 
-    dev_pct   = np.abs(latest_data - hist_mean_all) / np.maximum(hist_mean_all, 1) * 100
-    z_mad     = np.abs(latest_data - hist_mean_all) / np.maximum(hist_mad_all, 0.5)
-
-    pivot["Historical Mean"]  = np.round(hist_mean_all, 1)
-    pivot["Historical MAD"]   = np.round(hist_mad_all, 2)
-    pivot["Latest Count"]     = latest_data.astype(int)
-    pivot["Deviation %"]      = np.round(dev_pct, 1)
-    pivot["MAD Z-Score"]      = np.round(z_mad, 2)
-
+    # Priority ranking
     conditions = [
-        (dev_pct <= fp_thresh_pct) & (z_mad <= mad_k),
-        dev_pct <= fp_thresh_pct * 2,
+        dev_pct >= high_thresh,
+        dev_pct >= med_thresh,
     ]
-    pivot["FP Confidence"] = np.select(conditions, ["🟢 High", "🟡 Medium"],
-                                       default="🔴 Low (not FP)")
-    pivot["Confirm as FP"] = pivot["FP Confidence"] == "🟢 High"
+    pivot["Priority"] = np.select(conditions, ["🔴 High", "🟡 Medium"], default="🟢 Low / FP Candidate")
+    pivot["Tag for Review"] = pivot["Priority"] == "🔴 High"
 
-    # Add per-period count columns
+    # Per-period ABS GBP columns for display
     for p in period_order:
-        pivot[f"Count {p}"] = pivot.get(p, pd.Series(0, index=pivot.index)).fillna(0).astype(int)
+        pivot[f"ABS {p}"] = pivot[p].round(0)
 
-    result_df = pivot.sort_values("FP Confidence").reset_index(drop=True)
+    result_df = pivot.sort_values("Priority", ascending=True).reset_index(drop=True)
 
-    display_cols = seg_cols + [
-        "Historical Mean", "Historical MAD", "Latest Count",
-        "Deviation %", "MAD Z-Score", "FP Confidence", "Confirm as FP"
-    ] + [f"Count {p}" for p in period_order]
+    # ── Summary KPIs ───────────────────────────────────────────────────────────
+    n_high = int((result_df["Priority"] == "🔴 High").sum())
+    n_med  = int((result_df["Priority"] == "🟡 Medium").sum())
+    n_low  = int((result_df["Priority"] == "🟢 Low / FP Candidate").sum())
+    k1, k2, k3, k4 = st.columns(4)
+    with k1: kpi_card("Latest Period", latest_period)
+    with k2: kpi_card("High Priority", str(n_high), "segments materially elevated", warn=(n_high > 0))
+    with k3: kpi_card("Medium Priority", str(n_med), "segments slightly elevated")
+    with k4: kpi_card("Low / FP Candidates", str(n_low), "within historical norms")
+
+    # ── Priority table ────────────────────────────────────────────────────────
+    display_cols = [seg_sel, "Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
+                    "vs Hist Avg %", "Trend", "Tag for Review"] + [f"ABS {p}" for p in period_order]
     display_df = result_df[[c for c in display_cols if c in result_df.columns]]
 
-    st.markdown(f"### FP Candidates — Latest Period: {latest_period}")
-    high_count = int((result_df["FP Confidence"] == "🟢 High").sum())
-    med_count  = int((result_df["FP Confidence"] == "🟡 Medium").sum())
-    st.markdown(f"Found **{high_count}** High confidence and **{med_count}** Medium confidence FP candidates.")
+    st.markdown(f"### Priority Ranking by {seg_sel} — Latest: {latest_period}")
 
     edited = st.data_editor(
         display_df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Confirm as FP": st.column_config.CheckboxColumn("Confirm as FP", default=False),
+            "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
+            "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
+            "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
+            "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
         },
         key="_fp_editor",
     )
 
-    if st.button("Apply FP Confirmations to Filters", key="_fp_apply"):
-        confirmed = edited[edited["Confirm as FP"] == True]
+    if st.button("Apply Tagged Segments to Filters", key="_fp_apply"):
+        confirmed = edited[edited["Tag for Review"] == True]
         if len(confirmed) > 0:
-            fp_seg_keys = [tuple(row[c] for c in seg_cols) for _, row in confirmed.iterrows()]
-            st.session_state["_fp_seg_keys"] = fp_seg_keys
-            st.session_state["_fp_seg_cols"] = seg_cols
-            st.success(f"✅ {len(fp_seg_keys)} FP segments confirmed. Enable 'Exclude Confirmed False Positives' in the sidebar to filter them out.")
+            fp_seg_keys = list(confirmed[seg_sel].astype(str).tolist())
+            st.session_state["_fp_seg_keys_v2"] = fp_seg_keys
+            st.session_state["_fp_seg_col_v2"]  = seg_sel
+            st.success(f"✅ {len(fp_seg_keys)} segments tagged for review.")
         else:
-            st.session_state["_fp_seg_keys"] = []
-            st.session_state["_fp_seg_cols"] = []
-            st.info("No FP confirmations selected.")
+            st.info("No segments tagged.")
+
+    # ── ABS GBP Trend chart for top-10 segments ────────────────────────────────
+    top10_segs = result_df.nlargest(10, "Latest ABS GBP")[seg_sel].tolist()
+    trend_rows = grp[grp[seg_sel].isin(top10_segs)].copy()
+    trend_rows[abs_col] = trend_rows[abs_col].round(0)
+    if len(trend_rows) > 0:
+        fig_t = px.line(
+            trend_rows.sort_values("_Period_label"),
+            x="_Period_label", y=abs_col, color=seg_sel,
+            color_discrete_sequence=COLORS, markers=True,
+        )
+        fig_t = chart_layout(fig_t, f"ABS GBP Trend — Top 10 by {seg_sel}",
+                             "Period", "ABS GBP (£)", height=420)
+        st.plotly_chart(fig_t, use_container_width=True)
 
     # Download
     st.download_button(
-        "📥 Download FP Analysis (CSV)",
+        "📥 Download Priority Analysis (CSV)",
         display_df.to_csv(index=False).encode("utf-8"),
-        file_name="fp_thresholding.csv",
+        file_name="break_priority_thresholding.csv",
         mime="text/csv",
     )
 
@@ -1968,7 +2028,7 @@ def main():
     with tab1:
         tab_data_quality(df, df_f, col_map)
     with tab2:
-        tab_ageing_validation(df_f, col_map)
+        tab_ageing_validation(df_f, col_map, hist_df)
     with tab3:
         tab_break_counts(df_f, col_map, hist_df)
     with tab4:
@@ -1976,7 +2036,7 @@ def main():
     with tab5:
         tab_jira_factor_analysis(df_f, col_map, hist_df)
     with tab6:
-        tab_fp_thresholding(df_f, col_map)
+        tab_fp_thresholding(df_f, col_map, hist_df)
 
 
 if __name__ == "__main__":
