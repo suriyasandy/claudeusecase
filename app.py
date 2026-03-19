@@ -357,7 +357,8 @@ EXPECTED_COLUMNS = {
     # Time
     "Date":     ["date", "break date", "trade date", "value date"],
     "Period":   ["period", "reporting period"],
-    "Age Days": ["age days", "age_days", "days aged", "days old"],
+    "Age Days":      ["age days", "age_days", "days aged", "days old"],
+    "Ageing Bucket": ["ageing bucket", "aging bucket", "age bucket", "age_bucket", "ageing_bucket"],
     # Amounts
     "ABS GBP":          ["abs gbp", "abs_gbp", "absolute gbp"],
     "BREAK AMOUNT GBP": ["break amount gbp", "break_amount_gbp", "amount gbp", "gbp amount"],
@@ -568,6 +569,26 @@ def _reset_filters():
             del st.session_state[k]
 
 
+def clear_all_cache() -> int:
+    """Delete all cached Parquet files and the period index from disk,
+    then wipe all session state keys. Returns number of files deleted."""
+    cache = _cache_dir()
+    deleted = 0
+    for fname in os.listdir(cache):
+        fpath = os.path.join(cache, fname)
+        try:
+            os.remove(fpath)
+            deleted += 1
+        except Exception:
+            pass
+    for k in list(st.session_state.keys()):
+        try:
+            del st.session_state[k]
+        except Exception:
+            pass
+    return deleted
+
+
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     if not filters:
         return df
@@ -708,6 +729,50 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
         if "_Computed_Age_Days" in df_f.columns:
             avg_age = df_f["_Computed_Age_Days"].mean()
             kpi_card("Avg Age (Days)", format_number(avg_age, 1))
+
+    # ── Pass/Fail Row A: Threshold Compliance (≤90d = Pass, >90d = Fail) ──
+    st.markdown("---")
+    st.markdown("#### Threshold Compliance (SLA: ≤90 Days)")
+    pass_count = total - old_count
+    pass_rate  = pass_count / max(total, 1) * 100
+    pa1, pa2, pa3 = st.columns(3)
+    with pa1:
+        kpi_card("✅ Pass (≤90d)", format_number(pass_count),
+                 f"{pass_rate:.1f}% of total", warn=False)
+    with pa2:
+        kpi_card("❌ Fail (>90d)", format_number(old_count),
+                 f"{old_pct:.1f}% of total", warn=old_pct > 20)
+    with pa3:
+        kpi_card("Pass Rate", f"{pass_rate:.1f}%",
+                 "% breaks within 90-day SLA", warn=pass_rate < 80)
+    st.caption("Pass = break aged ≤90 days (within SLA).  Fail = break aged >90 days (SLA breach).")
+
+    # ── Pass/Fail Row B: Source Bucket vs Computed Bucket Accuracy ──
+    bucket_col = col_map.get("Ageing Bucket")
+    if bucket_col and bucket_col in df_f.columns:
+        st.markdown("---")
+        st.markdown("#### Source Bucket Accuracy (Source vs Computed)")
+        src_norm  = df_f[bucket_col].astype(str).str.strip().str.lower()
+        comp_norm = df_f["_Computed_Bucket"].astype(str).str.strip().str.lower()
+        match_mask   = src_norm == comp_norm
+        matched      = int(match_mask.sum())
+        mismatched   = total - matched
+        match_rate   = matched / max(total, 1) * 100
+        mismatch_pct = mismatched / max(total, 1) * 100
+        pb1, pb2, pb3 = st.columns(3)
+        with pb1:
+            kpi_card("✅ Matched (Pass)", format_number(matched),
+                     f"{match_rate:.1f}% of total", warn=False)
+        with pb2:
+            kpi_card("❌ Mismatched (Fail)", format_number(mismatched),
+                     f"{mismatch_pct:.1f}% of total", warn=mismatch_pct > 5)
+        with pb3:
+            kpi_card("Bucket Accuracy", f"{match_rate:.1f}%",
+                     "Source bucket matches computed", warn=match_rate < 95)
+        st.caption(
+            "Compares the source system's Ageing Bucket column against the bucket computed from Age Days. "
+            "A mismatch indicates a data quality issue in the source system's classification."
+        )
 
     st.markdown("---")
 
@@ -2185,6 +2250,15 @@ def main():
         "Upload the current period file (required). Optionally upload a historical "
         "file with previous periods to enable trend comparison."
     )
+
+    # ── Cache Management ──
+    with st.sidebar.expander("🗑️ Cache Management", expanded=False):
+        cache_files = [f for f in os.listdir(_cache_dir()) if f.endswith(".parquet")]
+        st.caption(f"Cached files: {len(cache_files)}")
+        if st.button("Clear Cache & Reset Session", key="_clear_cache_btn"):
+            n = clear_all_cache()
+            st.success(f"Cleared {n} cached file(s). Upload a new file to begin.")
+            st.rerun()
 
     uploaded_latest = st.sidebar.file_uploader(
         "📂 Latest Period File",
