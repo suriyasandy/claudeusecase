@@ -537,6 +537,14 @@ def build_sidebar_filters(df: pd.DataFrame, col_map: dict) -> dict:
     excl_fp = st.sidebar.checkbox("Exclude Confirmed False Positives", value=False, key="_excl_fp")
     if excl_fp:
         filters["_EXCL_FP"] = True
+        fp_keys_v2 = st.session_state.get("_fp_seg_keys_v2", [])
+        fp_col_v2  = st.session_state.get("_fp_seg_col_v2", "")
+        if fp_keys_v2 and fp_col_v2:
+            st.sidebar.caption(
+                f"Will exclude {len(fp_keys_v2)} tagged segment(s) from **{fp_col_v2}**."
+            )
+        else:
+            st.sidebar.caption("No segments tagged yet. Use the FP Thresholding tab to tag.")
 
     st.sidebar.markdown("---")
 
@@ -569,6 +577,7 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     result = df.copy()
     for key, val in filters.items():
         if key == "_EXCL_FP":
+            # Legacy multi-column tuple exclusion
             fp_keys = st.session_state.get("_fp_seg_keys", [])
             fp_cols = st.session_state.get("_fp_seg_cols", [])
             if fp_keys and fp_cols:
@@ -580,9 +589,13 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
                             seg_mask &= result[c].astype(str) == str(v)
                     excl_mask &= ~seg_mask
                 result = result[excl_mask]
-            else:
-                if "_FP_Confirmed" in result.columns:
-                    result = result[~result["_FP_Confirmed"]]
+            # New single-column exclusion from redesigned FP / Priority tab
+            fp_keys_v2 = st.session_state.get("_fp_seg_keys_v2", [])
+            fp_col_v2  = st.session_state.get("_fp_seg_col_v2", "")
+            if fp_keys_v2 and fp_col_v2 and fp_col_v2 in result.columns:
+                result = result[~result[fp_col_v2].astype(str).isin(
+                    [str(v) for v in fp_keys_v2]
+                )]
         elif key in result.columns:
             result = result[result[key].astype(str).isin([str(v) for v in val])]
     return result
@@ -808,6 +821,15 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
 
             rec_df = df_f[df_f[rec_actual].astype(str) == selected_rec].copy()
 
+            # Build combined source (hist + current) for trend charts
+            if (hist_df is not None and len(hist_df) > 0
+                    and "_Period_label" in hist_df.columns
+                    and rec_actual in hist_df.columns):
+                rec_hist_df = hist_df[hist_df[rec_actual].astype(str) == selected_rec].copy()
+                rec_combined_df = pd.concat([rec_hist_df, rec_df], ignore_index=True)
+            else:
+                rec_combined_df = rec_df
+
             if len(rec_df) == 0:
                 st.warning("No data for selected Rec Name.")
             else:
@@ -858,7 +880,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                             f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
                             f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                             f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
+                            rec_tbl=rec_combined_df
                         )
                         fig_d = px.bar(
                             period_cnt, x="_Period_label", y="cnt", color=_dim_col,
@@ -876,7 +898,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                         period_cnt = dq_local(
                             'SELECT "_Period_label", COUNT(*) AS cnt '
                             'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
+                            rec_tbl=rec_combined_df
                         )
                         fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
                                        color_discrete_sequence=[PRIMARY])
@@ -892,7 +914,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                                 f'SUM({safe_amt(abs_actual)}) AS total_amt '
                                 f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                                 f'ORDER BY "_Period_label"',
-                                rec_tbl=rec_df
+                                rec_tbl=rec_combined_df
                             )
                             fig_d = px.bar(
                                 period_amt_stk, x="_Period_label", y="total_amt",
@@ -908,7 +930,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                             period_amt = dq_local(
                                 f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
                                 f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                                rec_tbl=rec_df
+                                rec_tbl=rec_combined_df
                             )
                             fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
                                            color_discrete_sequence=[PRIMARY])
