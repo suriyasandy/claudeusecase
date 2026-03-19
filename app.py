@@ -537,6 +537,14 @@ def build_sidebar_filters(df: pd.DataFrame, col_map: dict) -> dict:
     excl_fp = st.sidebar.checkbox("Exclude Confirmed False Positives", value=False, key="_excl_fp")
     if excl_fp:
         filters["_EXCL_FP"] = True
+        fp_keys_v2 = st.session_state.get("_fp_seg_keys_v2", [])
+        fp_col_v2  = st.session_state.get("_fp_seg_col_v2", "")
+        if fp_keys_v2 and fp_col_v2:
+            st.sidebar.caption(
+                f"Will exclude {len(fp_keys_v2)} tagged segment(s) from **{fp_col_v2}**."
+            )
+        else:
+            st.sidebar.caption("No segments tagged yet. Use the FP Thresholding tab to tag.")
 
     st.sidebar.markdown("---")
 
@@ -569,6 +577,7 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     result = df.copy()
     for key, val in filters.items():
         if key == "_EXCL_FP":
+            # Legacy multi-column tuple exclusion
             fp_keys = st.session_state.get("_fp_seg_keys", [])
             fp_cols = st.session_state.get("_fp_seg_cols", [])
             if fp_keys and fp_cols:
@@ -580,9 +589,13 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
                             seg_mask &= result[c].astype(str) == str(v)
                     excl_mask &= ~seg_mask
                 result = result[excl_mask]
-            else:
-                if "_FP_Confirmed" in result.columns:
-                    result = result[~result["_FP_Confirmed"]]
+            # New single-column exclusion from redesigned FP / Priority tab
+            fp_keys_v2 = st.session_state.get("_fp_seg_keys_v2", [])
+            fp_col_v2  = st.session_state.get("_fp_seg_col_v2", "")
+            if fp_keys_v2 and fp_col_v2 and fp_col_v2 in result.columns:
+                result = result[~result[fp_col_v2].astype(str).isin(
+                    [str(v) for v in fp_keys_v2]
+                )]
         elif key in result.columns:
             result = result[result[key].astype(str).isin([str(v) for v in val])]
     return result
@@ -808,6 +821,15 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
 
             rec_df = df_f[df_f[rec_actual].astype(str) == selected_rec].copy()
 
+            # Build combined source (hist + current) for trend charts
+            if (hist_df is not None and len(hist_df) > 0
+                    and "_Period_label" in hist_df.columns
+                    and rec_actual in hist_df.columns):
+                rec_hist_df = hist_df[hist_df[rec_actual].astype(str) == selected_rec].copy()
+                rec_combined_df = pd.concat([rec_hist_df, rec_df], ignore_index=True)
+            else:
+                rec_combined_df = rec_df
+
             if len(rec_df) == 0:
                 st.warning("No data for selected Rec Name.")
             else:
@@ -858,7 +880,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                             f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
                             f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                             f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
+                            rec_tbl=rec_combined_df
                         )
                         fig_d = px.bar(
                             period_cnt, x="_Period_label", y="cnt", color=_dim_col,
@@ -876,7 +898,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                         period_cnt = dq_local(
                             'SELECT "_Period_label", COUNT(*) AS cnt '
                             'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
+                            rec_tbl=rec_combined_df
                         )
                         fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
                                        color_discrete_sequence=[PRIMARY])
@@ -892,7 +914,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                                 f'SUM({safe_amt(abs_actual)}) AS total_amt '
                                 f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                                 f'ORDER BY "_Period_label"',
-                                rec_tbl=rec_df
+                                rec_tbl=rec_combined_df
                             )
                             fig_d = px.bar(
                                 period_amt_stk, x="_Period_label", y="total_amt",
@@ -908,7 +930,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                             period_amt = dq_local(
                                 f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
                                 f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                                rec_tbl=rec_df
+                                rec_tbl=rec_combined_df
                             )
                             fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
                                            color_discrete_sequence=[PRIMARY])
@@ -1289,7 +1311,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         gb = GridOptionsBuilder.from_dataframe(summary_df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
         gb.configure_default_column(filterable=True, sortable=True, resizable=True,
-                                    wrapText=True, autoHeight=True)
+                                    wrapText=True, autoHeight=True, floatingFilter=True)
         gb.configure_column(selected_label, pinned="left", width=160)
         if "Jira Description" in summary_df.columns:
             gb.configure_column("Jira Description", width=300,
@@ -1314,11 +1336,11 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
-        AgGrid(summary_df, gridOptions=gb.build(), height=440,
+        AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
-        st.dataframe(summary_df, height=440, use_container_width=True)
+        st.dataframe(summary_df, height=500, use_container_width=True)
 
     # ── Download button right below the table ──
     st.download_button(
@@ -1327,6 +1349,108 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
         mime="text/csv",
     )
+
+    # ── Drill-Down: select a dimension value and break it by a secondary dim ──
+    st.markdown("---")
+    st.markdown(f"### Drill-Down: {selected_label} → Secondary Breakdown")
+
+    _type_col = col_map.get("Type of Break")
+    _secondary_opts = {}
+    for _lbl, _col in {
+        "Team":          team_col,
+        "Rec Name":      rec_col,
+        "Entity":        entity_col,
+        "Asset Class":   ac_col,
+        "Type of Break": _type_col,
+        "True/Systemic": ts_col,
+    }.items():
+        if _col and _col != dim_col and _col in _summary_src.columns:
+            _secondary_opts[_lbl] = _col
+
+    if not _secondary_opts:
+        st.info("No secondary breakdown columns available for the current dimension.")
+    else:
+        _dim_vals = sorted(
+            v for v in _summary_src[dim_col].dropna().astype(str).unique()
+            if v not in ("", "nan", "None", "N/A", "-")
+        )
+        if not _dim_vals:
+            st.info("No values found to drill into.")
+        else:
+            dd1, dd2, dd3 = st.columns([3, 2, 2])
+            with dd1:
+                _sel_val = st.selectbox(
+                    f"Select {selected_label}:",
+                    _dim_vals, key="jira_drill_val",
+                )
+            with dd2:
+                _drill_dim_lbl = st.selectbox(
+                    "Breakdown by", list(_secondary_opts.keys()),
+                    key="jira_drill_dim",
+                )
+            with dd3:
+                _drill_metric = st.radio(
+                    "Metric", ["Count", "ABS GBP"], horizontal=True,
+                    key="jira_drill_metric",
+                )
+
+            _drill_dim_col = _secondary_opts[_drill_dim_lbl]
+            _drill_src = _summary_src[
+                _summary_src[dim_col].astype(str) == _sel_val
+            ].copy()
+
+            if len(_drill_src) == 0:
+                st.info(f"No data found for {selected_label} = {_sel_val}.")
+            else:
+                st.markdown(
+                    f'<div class="banner-drill">🔬 Drilling into: <b>{_sel_val}</b> '
+                    f'— breakdown by <b>{_drill_dim_lbl}</b></div>',
+                    unsafe_allow_html=True,
+                )
+                _fig_dd = None
+                if _drill_metric == "Count":
+                    _drill_trend = dq_local(
+                        f'SELECT "_Period_label", "{_drill_dim_col}", COUNT(*) AS cnt '
+                        f'FROM tbl WHERE "_Period_label" IS NOT NULL '
+                        f'GROUP BY "_Period_label", "{_drill_dim_col}" '
+                        f'ORDER BY "_Period_label"',
+                        tbl=_drill_src,
+                    )
+                    _fig_dd = px.bar(
+                        _drill_trend, x="_Period_label", y="cnt",
+                        color=_drill_dim_col,
+                        color_discrete_sequence=COLORS, barmode="stack",
+                    )
+                    _fig_dd = chart_layout(
+                        _fig_dd,
+                        f"{_sel_val} — Breaks by Period × {_drill_dim_lbl}",
+                        "Period", "Break Count", height=420,
+                    )
+                else:
+                    if abs_col and abs_col in _drill_src.columns:
+                        _drill_trend = dq_local(
+                            f'SELECT "_Period_label", "{_drill_dim_col}", '
+                            f'SUM(ABS("{abs_col}")) AS total_abs '
+                            f'FROM tbl WHERE "_Period_label" IS NOT NULL '
+                            f'GROUP BY "_Period_label", "{_drill_dim_col}" '
+                            f'ORDER BY "_Period_label"',
+                            tbl=_drill_src,
+                        )
+                        _fig_dd = px.bar(
+                            _drill_trend, x="_Period_label", y="total_abs",
+                            color=_drill_dim_col,
+                            color_discrete_sequence=COLORS, barmode="stack",
+                        )
+                        _fig_dd = chart_layout(
+                            _fig_dd,
+                            f"{_sel_val} — ABS GBP by Period × {_drill_dim_lbl}",
+                            "Period", "ABS GBP (£)", height=420,
+                        )
+                    else:
+                        st.info("No ABS GBP column available for Amount metric.")
+
+                if _fig_dd is not None:
+                    st.plotly_chart(_fig_dd, use_container_width=True)
 
     st.markdown("---")
 
@@ -1490,20 +1614,20 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     # ─────────────────────────────────────────────────────────────────────
     # Trend over periods — Top 5, legend annotated with Jira Desc
     # ─────────────────────────────────────────────────────────────────────
-    if "_Period_label" in df.columns and period_order:
+    if "_Period_label" in _summary_src.columns and period_order:
         st.markdown(f"### {selected_label} — Break Count Trend Over Periods (Top 5)")
         top5 = dq(f"""
             SELECT "{dim_col}" AS factor FROM tbl
             WHERE "{dim_col}" IS NOT NULL
               AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
             GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
-        """, df)["factor"].tolist()
+        """, _summary_src)["factor"].tolist()
         top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
         trend_df = dq(f"""
             SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
             FROM tbl WHERE "{dim_col}" IN ({top5_str})
             GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
-        """, df)
+        """, _summary_src)
         if dmap:
             trend_df["factor_label"] = trend_df["factor"].apply(
                 lambda x: _short_label(x, dmap, max_chars=40))
@@ -1530,7 +1654,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
               AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
             GROUP BY "{dim_col}"
             HAVING (lat > 0 OR prv > 0)
-        """, df)
+        """, _summary_src)
         mom_df["delta"] = mom_df["lat"] - mom_df["prv"]
         mom_df = mom_df.sort_values("delta")
         colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["delta"]]
@@ -1736,9 +1860,43 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     with k3: kpi_card("Medium Priority", str(n_med), "segments slightly elevated")
     with k4: kpi_card("Low / FP Candidates", str(n_low), "within historical norms")
 
+    # ── Jira metadata enrichment: top Jira per segment value ────────────────
+    jira_ref_col_fp  = col_map.get("Jira Reference")
+    jira_desc_col_fp = col_map.get("Jira Desc")
+    system_col_fp    = col_map.get("System to be Fixed")
+    _jira_display_cols = []
+    if jira_ref_col_fp and jira_ref_col_fp in df_f.columns and seg_sel in df_f.columns:
+        _jira_src_cols = [seg_sel, jira_ref_col_fp]
+        if jira_desc_col_fp and jira_desc_col_fp in df_f.columns:
+            _jira_src_cols.append(jira_desc_col_fp)
+        if system_col_fp and system_col_fp in df_f.columns:
+            _jira_src_cols.append(system_col_fp)
+        _grp_cols = list(dict.fromkeys(_jira_src_cols))  # deduplicate preserving order
+        jira_meta = (
+            df_f[_grp_cols]
+            .dropna(subset=[jira_ref_col_fp])
+            .groupby(_grp_cols)
+            .size().reset_index(name="_cnt")
+            .sort_values("_cnt", ascending=False)
+            .drop_duplicates(subset=[seg_sel])
+            .drop(columns="_cnt")
+            .rename(columns={
+                jira_ref_col_fp: "Top Jira",
+                **({jira_desc_col_fp: "Jira Desc"} if jira_desc_col_fp else {}),
+                **({system_col_fp:    "System to be Fixed"} if system_col_fp else {}),
+            })
+        )
+        result_df = result_df.merge(jira_meta, on=seg_sel, how="left")
+        _jira_display_cols = [c for c in ["Top Jira", "Jira Desc", "System to be Fixed"]
+                              if c in result_df.columns]
+
     # ── Priority table ────────────────────────────────────────────────────────
-    display_cols = [seg_sel, "Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
-                    "vs Hist Avg %", "Trend", "Tag for Review"] + [f"ABS {p}" for p in period_order]
+    display_cols = (
+        [seg_sel] + _jira_display_cols +
+        ["Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
+         "vs Hist Avg %", "Trend", "Tag for Review"] +
+        [f"ABS {p}" for p in period_order]
+    )
     display_df = result_df[[c for c in display_cols if c in result_df.columns]]
 
     st.markdown(f"### Priority Ranking by {seg_sel} — Latest: {latest_period}")
