@@ -200,7 +200,7 @@ def add_rolling_avg(fig, df, x_col: str, y_col: str, name: str = "Rolling Avg"):
 def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
     if HAS_AGGRID:
         gb = GridOptionsBuilder.from_dataframe(df)
-        gb.configure_default_column(resizable=True, sortable=True, filter=True)
+        gb.configure_default_column(resizable=True, sortable=True, filter=True, floatingFilter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
