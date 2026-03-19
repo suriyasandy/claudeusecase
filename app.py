@@ -394,7 +394,7 @@ EXPECTED_COLUMNS = {
 
 
 def fuzzy_match(col_name: str, candidates: list[str]) -> bool:
-    cn = col_name.lower().strip()
+    cn = str(col_name).lower().strip()
     return any(c in cn or cn in c for c in candidates)
 
 
