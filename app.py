@@ -1311,7 +1311,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         gb = GridOptionsBuilder.from_dataframe(summary_df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
         gb.configure_default_column(filterable=True, sortable=True, resizable=True,
-                                    wrapText=True, autoHeight=True)
+                                    wrapText=True, autoHeight=True, floatingFilter=True)
         gb.configure_column(selected_label, pinned="left", width=160)
         if "Jira Description" in summary_df.columns:
             gb.configure_column("Jira Description", width=300,
@@ -1336,11 +1336,11 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
-        AgGrid(summary_df, gridOptions=gb.build(), height=440,
+        AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
-        st.dataframe(summary_df, height=440, use_container_width=True)
+        st.dataframe(summary_df, height=500, use_container_width=True)
 
     # ── Download button right below the table ──
     st.download_button(
@@ -1860,9 +1860,43 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     with k3: kpi_card("Medium Priority", str(n_med), "segments slightly elevated")
     with k4: kpi_card("Low / FP Candidates", str(n_low), "within historical norms")
 
+    # ── Jira metadata enrichment: top Jira per segment value ────────────────
+    jira_ref_col_fp  = col_map.get("Jira Reference")
+    jira_desc_col_fp = col_map.get("Jira Desc")
+    system_col_fp    = col_map.get("System to be Fixed")
+    _jira_display_cols = []
+    if jira_ref_col_fp and jira_ref_col_fp in df_f.columns and seg_sel in df_f.columns:
+        _jira_src_cols = [seg_sel, jira_ref_col_fp]
+        if jira_desc_col_fp and jira_desc_col_fp in df_f.columns:
+            _jira_src_cols.append(jira_desc_col_fp)
+        if system_col_fp and system_col_fp in df_f.columns:
+            _jira_src_cols.append(system_col_fp)
+        _grp_cols = list(dict.fromkeys(_jira_src_cols))  # deduplicate preserving order
+        jira_meta = (
+            df_f[_grp_cols]
+            .dropna(subset=[jira_ref_col_fp])
+            .groupby(_grp_cols)
+            .size().reset_index(name="_cnt")
+            .sort_values("_cnt", ascending=False)
+            .drop_duplicates(subset=[seg_sel])
+            .drop(columns="_cnt")
+            .rename(columns={
+                jira_ref_col_fp: "Top Jira",
+                **({jira_desc_col_fp: "Jira Desc"} if jira_desc_col_fp else {}),
+                **({system_col_fp:    "System to be Fixed"} if system_col_fp else {}),
+            })
+        )
+        result_df = result_df.merge(jira_meta, on=seg_sel, how="left")
+        _jira_display_cols = [c for c in ["Top Jira", "Jira Desc", "System to be Fixed"]
+                              if c in result_df.columns]
+
     # ── Priority table ────────────────────────────────────────────────────────
-    display_cols = [seg_sel, "Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
-                    "vs Hist Avg %", "Trend", "Tag for Review"] + [f"ABS {p}" for p in period_order]
+    display_cols = (
+        [seg_sel] + _jira_display_cols +
+        ["Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
+         "vs Hist Avg %", "Trend", "Tag for Review"] +
+        [f"ABS {p}" for p in period_order]
+    )
     display_df = result_df[[c for c in display_cols if c in result_df.columns]]
 
     st.markdown(f"### Priority Ranking by {seg_sel} — Latest: {latest_period}")
