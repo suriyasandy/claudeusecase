@@ -538,11 +538,18 @@ def build_sidebar_filters(df: pd.DataFrame, col_map: dict) -> dict:
         filters["_EXCL_FP"] = True
 
     st.sidebar.markdown("---")
-    if st.sidebar.button("Apply Filters", key="_apply_btn"):
+
+    # Show pending-changes indicator if live widget state differs from applied snapshot
+    applied = st.session_state.get("_filters_applied", {})
+    _pending = filters != applied
+    if _pending:
+        st.sidebar.warning("⚠️ Pending filter changes — click **Apply Filters** to update charts.")
+
+    if st.sidebar.button("Apply Filters", key="_apply_btn", type="primary"):
         st.session_state["_filters_applied"] = filters
         st.rerun()
 
-    return st.session_state.get("_filters_applied", {})
+    return applied
 
 
 def _reset_filters():
@@ -733,7 +740,7 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict) -> None:
 
 # ── Tab: Break Counts + Drill-Down ────────────────────────────────────────────
 
-def tab_break_counts(df_f: pd.DataFrame, col_map: dict) -> None:
+def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
     st.markdown("## 📈 Break Counts + Drill-Down")
 
     rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
@@ -745,8 +752,18 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict) -> None:
 
     # Top-10 Rec Names trend
     if rec_actual and rec_actual in df_f.columns:
-        top10_series = df_f[rec_actual].value_counts().head(10).index.tolist()
-        top10_df = df_f[df_f[rec_actual].isin(top10_series)]
+        # Combine hist + current so trend spans all available periods
+        _trend_cols = [rec_actual, "_Period_label"]
+        if (hist_df is not None and len(hist_df) > 0
+                and "_Period_label" in hist_df.columns
+                and rec_actual in hist_df.columns):
+            _trend_src = pd.concat(
+                [hist_df[_trend_cols], df_f[_trend_cols]], ignore_index=True
+            )
+        else:
+            _trend_src = df_f[_trend_cols]
+        top10_series = _trend_src[rec_actual].value_counts().head(10).index.tolist()
+        top10_df = _trend_src[_trend_src[rec_actual].isin(top10_series)]
         trend = (
             top10_df.groupby(["_Period_label", rec_actual])
             .size()
@@ -791,124 +808,111 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict) -> None:
                 with st.container():
                     st.markdown('<div class="drill-section">', unsafe_allow_html=True)
 
-                    # 1. Period × Team
-                    if team_actual and team_actual in rec_df.columns:
-                        period_cnt = dq_local(
-                            f'SELECT "_Period_label", "{team_actual}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{team_actual}" '
-                            f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
-                        )
-                        fig_pt = px.bar(
-                            period_cnt, x="_Period_label", y="cnt", color=team_actual,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_pt = chart_layout(fig_pt, f"Breaks by Period × Team — {selected_rec}",
-                                              "Period", "Count", height=340)
-                        st.plotly_chart(fig_pt, use_container_width=True)
-
-                    # 2. Period × Entity
+                    # ── Toggle controls ───────────────────────────────────────
                     entity_actual = col_map.get("Entity")
-                    if entity_actual and entity_actual in rec_df.columns:
-                        period_ent = dq_local(
-                            f'SELECT "_Period_label", "{entity_actual}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{entity_actual}" '
+                    type_actual   = col_map.get("Type of Break")
+                    ac_actual     = col_map.get("Asset Class")
+                    abs_actual    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+
+                    # Build available breakdown dims (only those present in data)
+                    _dim_opts = []
+                    if team_actual   and team_actual   in rec_df.columns: _dim_opts.append("Team")
+                    if entity_actual and entity_actual in rec_df.columns: _dim_opts.append("Entity")
+                    if type_actual   and type_actual   in rec_df.columns: _dim_opts.append("Type of Break")
+                    if ac_actual     and ac_actual     in rec_df.columns: _dim_opts.append("Asset Class")
+
+                    _has_amount = bool(abs_actual and abs_actual in rec_df.columns)
+                    _metric_opts = ["Count", "Amount"] if _has_amount else ["Count"]
+
+                    tc1, tc2 = st.columns([2, 3])
+                    with tc1:
+                        _drill_metric = st.radio(
+                            "Metric", _metric_opts, horizontal=True,
+                            key="_drill_metric",
+                        )
+                    with tc2:
+                        if _dim_opts:
+                            _drill_dim = st.selectbox(
+                                "Breakdown by", _dim_opts, key="_drill_dim",
+                            )
+                        else:
+                            _drill_dim = None
+
+                    # ── Single chart based on toggle selection ─────────────────
+                    if _drill_metric == "Count" and _drill_dim:
+                        _dim_col = {
+                            "Team":          team_actual,
+                            "Entity":        entity_actual,
+                            "Type of Break": type_actual,
+                            "Asset Class":   ac_actual,
+                        }[_drill_dim]
+                        period_cnt = dq_local(
+                            f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
+                            f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                             f'ORDER BY "_Period_label"',
                             rec_tbl=rec_df
                         )
-                        fig_pe = px.bar(
-                            period_ent, x="_Period_label", y="cnt", color=entity_actual,
+                        fig_d = px.bar(
+                            period_cnt, x="_Period_label", y="cnt", color=_dim_col,
                             color_discrete_sequence=COLORS, barmode="stack",
                         )
-                        fig_pe = chart_layout(fig_pe, f"Breaks by Period × Entity — {selected_rec}",
-                                              "Period", "Count", height=340)
-                        st.plotly_chart(fig_pe, use_container_width=True)
+                        fig_d = chart_layout(
+                            fig_d,
+                            f"Breaks by Period × {_drill_dim} — {selected_rec}",
+                            "Period", "Count", height=380,
+                        )
+                        st.plotly_chart(fig_d, use_container_width=True)
 
-                    # 3. Period × Type of Break
-                    type_actual = col_map.get("Type of Break")
-                    if type_actual and type_actual in rec_df.columns:
-                        period_type = dq_local(
-                            f'SELECT "_Period_label", "{type_actual}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{type_actual}" '
-                            f'ORDER BY "_Period_label"',
+                    elif _drill_metric == "Count" and not _drill_dim:
+                        # Fallback: plain period trend
+                        period_cnt = dq_local(
+                            'SELECT "_Period_label", COUNT(*) AS cnt '
+                            'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
                             rec_tbl=rec_df
                         )
-                        fig_ptype = px.bar(
-                            period_type, x="_Period_label", y="cnt", color=type_actual,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_ptype = chart_layout(fig_ptype, f"Breaks by Period × Type of Break — {selected_rec}",
-                                                 "Period", "Count", height=340)
-                        st.plotly_chart(fig_ptype, use_container_width=True)
+                        fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
+                                       color_discrete_sequence=[PRIMARY])
+                        fig_d = chart_layout(fig_d, f"Breaks by Period — {selected_rec}",
+                                             "Period", "Count", height=360)
+                        st.plotly_chart(fig_d, use_container_width=True)
 
-                    # 4. Period × Asset Class
-                    ac_actual = col_map.get("Asset Class")
-                    if ac_actual and ac_actual in rec_df.columns:
-                        period_ac = dq_local(
-                            f'SELECT "_Period_label", "{ac_actual}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{ac_actual}" '
-                            f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
-                        )
-                        fig_pac = px.bar(
-                            period_ac, x="_Period_label", y="cnt", color=ac_actual,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_pac = chart_layout(fig_pac, f"Breaks by Period × Asset Class — {selected_rec}",
-                                               "Period", "Count", height=340)
-                        st.plotly_chart(fig_pac, use_container_width=True)
-
-                    # 5. Amount breakdown (if available)
-                    abs_actual = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
-                    if abs_actual and abs_actual in rec_df.columns:
-                        period_amt = dq_local(
-                            f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
-                            f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_df
-                        )
-                        fig_amt = px.bar(
-                            period_amt, x="_Period_label", y="total_amt",
-                            color_discrete_sequence=[PRIMARY],
-                        )
-                        fig_amt.update_traces(
-                            text=[format_short(v) for v in period_amt["total_amt"]],
-                            textposition="outside"
-                        )
-                        fig_amt = chart_layout(fig_amt, f"ABS GBP by Period — {selected_rec}",
-                                               "Period", "ABS GBP (£)", height=320)
-                        st.plotly_chart(fig_amt, use_container_width=True)
-
-                        if team_actual and team_actual in rec_df.columns:
-                            period_amt_team = dq_local(
-                                f'SELECT "_Period_label", "{team_actual}", '
+                    elif _drill_metric == "Amount":
+                        if _drill_dim and _drill_dim in ("Team", "Entity"):
+                            _dim_col = team_actual if _drill_dim == "Team" else entity_actual
+                            period_amt_stk = dq_local(
+                                f'SELECT "_Period_label", "{_dim_col}", '
                                 f'SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label", "{team_actual}" '
+                                f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
                                 f'ORDER BY "_Period_label"',
                                 rec_tbl=rec_df
                             )
-                            fig_at = px.bar(
-                                period_amt_team, x="_Period_label", y="total_amt", color=team_actual,
-                                color_discrete_sequence=COLORS, barmode="stack",
+                            fig_d = px.bar(
+                                period_amt_stk, x="_Period_label", y="total_amt",
+                                color=_dim_col, color_discrete_sequence=COLORS, barmode="stack",
                             )
-                            fig_at = chart_layout(fig_at, f"ABS GBP by Period × Team — {selected_rec}",
-                                                  "Period", "ABS GBP (£)", height=340)
-                            st.plotly_chart(fig_at, use_container_width=True)
-
-                        if entity_actual and entity_actual in rec_df.columns:
-                            period_amt_ent = dq_local(
-                                f'SELECT "_Period_label", "{entity_actual}", '
-                                f'SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label", "{entity_actual}" '
-                                f'ORDER BY "_Period_label"',
+                            fig_d = chart_layout(
+                                fig_d,
+                                f"ABS GBP by Period × {_drill_dim} — {selected_rec}",
+                                "Period", "ABS GBP (£)", height=380,
+                            )
+                        else:
+                            # Amount by period only (no useful stack for Type/Asset Class)
+                            period_amt = dq_local(
+                                f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
+                                f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
                                 rec_tbl=rec_df
                             )
-                            fig_ae = px.bar(
-                                period_amt_ent, x="_Period_label", y="total_amt", color=entity_actual,
-                                color_discrete_sequence=COLORS, barmode="stack",
+                            fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
+                                           color_discrete_sequence=[PRIMARY])
+                            fig_d.update_traces(
+                                text=[format_short(v) for v in period_amt["total_amt"]],
+                                textposition="outside",
                             )
-                            fig_ae = chart_layout(fig_ae, f"ABS GBP by Period × Entity — {selected_rec}",
-                                                  "Period", "ABS GBP (£)", height=340)
-                            st.plotly_chart(fig_ae, use_container_width=True)
+                            fig_d = chart_layout(
+                                fig_d, f"ABS GBP by Period — {selected_rec}",
+                                "Period", "ABS GBP (£)", height=360,
+                            )
+                        st.plotly_chart(fig_d, use_container_width=True)
 
                     st.markdown('</div>', unsafe_allow_html=True)
     else:
@@ -922,7 +926,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict) -> None:
 
 # ── Tab: Amount Analysis ──────────────────────────────────────────────────────
 
-def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
+def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
     st.markdown("## 💷 Amount Analysis")
 
     abs_actual = col_map.get("ABS GBP")
@@ -949,12 +953,32 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
 
     st.markdown("---")
 
-    # Amount by Period
-    if "_Period_label" in df_f.columns:
+    # ── Chart view toggle ─────────────────────────────────────────────────────
+    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
+    team_actual = col_map.get("Team")
+
+    _view_opts = ["By Period"]
+    if rec_actual  and rec_actual  in df_f.columns: _view_opts.append("By Rec Name")
+    if team_actual and team_actual in df_f.columns: _view_opts.append("By Team")
+    _view_opts.append("Distribution")
+
+    _amt_view = st.radio("View", _view_opts, horizontal=True, key="_amt_view")
+
+    if _amt_view == "By Period" and "_Period_label" in df_f.columns:
+        # Merge historical periods so the chart shows full trend
+        if (hist_df is not None and len(hist_df) > 0
+                and "_Period_label" in hist_df.columns
+                and amt_col in hist_df.columns):
+            _period_src = pd.concat(
+                [hist_df[["_Period_label", amt_col]],
+                 df_f[["_Period_label", amt_col]]], ignore_index=True
+            )
+        else:
+            _period_src = df_f[["_Period_label", amt_col]]
         period_amt = dq_local(
             f'SELECT "_Period_label", SUM({safe_amt(amt_col)}) AS total_amt '
             f'FROM tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-            tbl=df_f
+            tbl=_period_src
         )
         fig = px.bar(
             period_amt, x="_Period_label", y="total_amt",
@@ -962,12 +986,10 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
             text=[format_short(v) for v in period_amt["total_amt"]],
         )
         fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=360)
+        fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
-    # Amount by Rec Name
-    rec_actual = col_map.get("Rec Name (as per Rec Cube)")
-    if rec_actual and rec_actual in df_f.columns:
+    elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
         rec_amt = (
             df_f.groupby(rec_actual)[amt_col]
             .apply(lambda x: x.abs().sum())
@@ -982,12 +1004,10 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
             text=[format_short(v) for v in rec_amt["Total ABS (£)"]],
         )
         fig2.update_traces(textposition="outside")
-        fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=380)
+        fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=420)
         st.plotly_chart(fig2, use_container_width=True)
 
-    # Amount by Team
-    team_actual = col_map.get("Team")
-    if team_actual and team_actual in df_f.columns:
+    elif _amt_view == "By Team" and team_actual and team_actual in df_f.columns:
         team_amt = (
             df_f.groupby(team_actual)[amt_col]
             .apply(lambda x: x.abs().sum())
@@ -1001,20 +1021,19 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
             text=[format_short(v) for v in team_amt["Total ABS (£)"]],
         )
         fig3.update_traces(textposition="outside")
-        fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=360)
+        fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=400)
         st.plotly_chart(fig3, use_container_width=True)
 
-    # Distribution histogram
-    st.markdown("### Amount Distribution")
-    amt_data = df_f[amt_col].dropna()
-    fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
-    fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=340)
-    st.plotly_chart(fig4, use_container_width=True)
+    else:  # Distribution
+        amt_data = df_f[amt_col].dropna()
+        fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
+        fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=400)
+        st.plotly_chart(fig4, use_container_width=True)
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
 
-def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
+def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     """
     Factor Analysis using Jira Reference (Jira Desc as lookup attribute — not a dimension)
     and System to be Fixed.
@@ -1107,8 +1126,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
     )
     dim_col = all_dims[selected_label]
 
-    period_order = (sorted(df["_Period_label"].dropna().unique().tolist())
-                    if "_Period_label" in df.columns else [])
+    # Determine period order from combined current + historical data
+    _period_sources = [df] if "_Period_label" in df.columns else []
+    if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
+        _period_sources.append(hist_df[["_Period_label"]])
+    if _period_sources:
+        _combined_periods = pd.concat(_period_sources, ignore_index=True)
+        period_order = sorted(_combined_periods["_Period_label"].dropna().unique().tolist())
+    else:
+        period_order = []
     latest = period_order[-1] if period_order else "0"
     prev   = period_order[-2] if len(period_order) >= 2 else "0"
 
@@ -1172,6 +1198,12 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
         '0 AS "Latest Period", 0 AS "Prev Period"'
     )
 
+    # Build combined source for summary: include hist data so Prev Period / Latest are populated
+    if hist_df is not None and len(hist_df) > 0 and "_Period_label" in hist_df.columns:
+        _summary_src = pd.concat([hist_df, df], ignore_index=True)
+    else:
+        _summary_src = df
+
     summary_df = dq(f"""
         SELECT
             "{dim_col}"  AS "{selected_label}",
@@ -1186,7 +1218,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
           AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
         GROUP BY "{dim_col}"
         ORDER BY "Break Count" DESC
-    """, df)
+    """, _summary_src)
 
     # ── Derived / enriched columns ──
     if "Total ABS GBP" in summary_df.columns:
@@ -1870,7 +1902,7 @@ def main():
         "📂 Historical Data (optional)",
         type=["xlsx", "xls", "csv", "parquet"],
         key="_file_hist",
-        help="Previous periods file for Period Comparison tab. Can contain multiple periods.",
+        help="Previous periods file for historical comparison. Shown as expanders in Break Counts, Amount Analysis, and Jira Factor Analysis tabs.",
     )
 
     if st.sidebar.button("Reset Filters", key="_reset_btn"):
@@ -1923,15 +1955,14 @@ def main():
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
 
-    # Tabs (Change 13)
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # Tabs — Period Comparison removed; historical data surfaced inside each tab
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🧹 Data Quality",
         "📅 Ageing Validation",
         "📈 Break Counts + Drill-Down",
         "💷 Amount Analysis",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
-        "📊 Period Comparison",
     ])
 
     with tab1:
@@ -1939,15 +1970,13 @@ def main():
     with tab2:
         tab_ageing_validation(df_f, col_map)
     with tab3:
-        tab_break_counts(df_f, col_map)
+        tab_break_counts(df_f, col_map, hist_df)
     with tab4:
-        tab_amount_analysis(df_f, col_map)
+        tab_amount_analysis(df_f, col_map, hist_df)
     with tab5:
-        tab_jira_factor_analysis(df_f, col_map)
+        tab_jira_factor_analysis(df_f, col_map, hist_df)
     with tab6:
         tab_fp_thresholding(df_f, col_map)
-    with tab7:
-        tab_period_comparison(df_f, hist_df, col_map)
 
 
 if __name__ == "__main__":
