@@ -182,7 +182,7 @@ def chart_layout(fig, title: str, xlab: str = "", ylab: str = "", height: int = 
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=40, r=20, t=60, b=40),
     )
-    fig.update_xaxes(showgrid=False, linecolor="#E0E0E0", type="category")
+    fig.update_xaxes(showgrid=False, linecolor="#E0E0E0")
     fig.update_yaxes(showgrid=True, gridcolor="#F0F0F0", linecolor="#E0E0E0")
     return fig
 
@@ -200,13 +200,13 @@ def add_rolling_avg(fig, df, x_col: str, y_col: str, name: str = "Rolling Avg"):
 def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
     if HAS_AGGRID:
         gb = GridOptionsBuilder.from_dataframe(df)
-        gb.configure_default_column(resizable=True, sortable=True, filter=True)
+        gb.configure_default_column(resizable=True, sortable=True, filter=True, floatingFilter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
-        st.dataframe(df, use_container_width=True, height=height)
+        st.dataframe(df, width='stretch', height=height)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -631,7 +631,7 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
             "Mapped To": actual or "❌ Not Found",
             "Status": "✅ Mapped" if actual else "⚠️ Missing",
         })
-    st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(mapping_rows), width='stretch', hide_index=True)
 
     st.markdown("---")
     st.markdown("### Null / Missing Value Summary")
@@ -643,7 +643,7 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
         pct = n_null / max(len(df_f), 1) * 100
         null_rows.append({"Column": col, "Null Count": n_null, "Null %": round(pct, 1)})
     null_df = pd.DataFrame(null_rows).sort_values("Null %", ascending=False)
-    st.dataframe(null_df, use_container_width=True, hide_index=True)
+    st.dataframe(null_df, width='stretch', hide_index=True)
 
     overflow_count = st.session_state.get("_overflow", 0)
     if overflow_count and overflow_count > 0:
@@ -718,7 +718,7 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
     )
     fig = chart_layout(fig, "Break Count by Age Bucket", "Age Bucket", "Count", height=380)
     fig.update_traces(textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # By Team
     team_actual = col_map.get("Team")
@@ -734,7 +734,7 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
             color_discrete_sequence=COLORS,
         )
         fig2 = chart_layout(fig2, "Age Bucket by Team", team_actual, "Count", height=400)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
     # Period trend of ageing — merge historical data if available
     if "_Period_label" in df_f.columns and "_Computed_Age_Days" in df_f.columns:
@@ -756,7 +756,7 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
         fig3 = px.line(age_trend, x="Period", y="Avg Age Days",
                        markers=True, color_discrete_sequence=[PRIMARY])
         fig3 = chart_layout(fig3, "Average Age Days Trend by Period", "Period", "Avg Age Days", height=340)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 
 # ── Tab: Break Counts + Drill-Down ────────────────────────────────────────────
@@ -796,7 +796,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
             color_discrete_sequence=COLORS, markers=True,
         )
         fig = chart_layout(fig, "Top-10 Rec Names — Break Count Trend", "Period", "Count", height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         st.markdown("---")
         # ── Drill-Down Section ────────────────────────────────────────────────
@@ -891,7 +891,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                             f"Breaks by Period × {_drill_dim} — {selected_rec}",
                             "Period", "Count", height=380,
                         )
-                        st.plotly_chart(fig_d, use_container_width=True)
+                        st.plotly_chart(fig_d, width='stretch')
 
                     elif _drill_metric == "Count" and not _drill_dim:
                         # Fallback: plain period trend
@@ -904,7 +904,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                                        color_discrete_sequence=[PRIMARY])
                         fig_d = chart_layout(fig_d, f"Breaks by Period — {selected_rec}",
                                              "Period", "Count", height=360)
-                        st.plotly_chart(fig_d, use_container_width=True)
+                        st.plotly_chart(fig_d, width='stretch')
 
                     elif _drill_metric == "Amount":
                         if _drill_dim and _drill_dim in ("Team", "Entity"):
@@ -942,7 +942,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
                                 fig_d, f"ABS GBP by Period — {selected_rec}",
                                 "Period", "ABS GBP (£)", height=360,
                             )
-                        st.plotly_chart(fig_d, use_container_width=True)
+                        st.plotly_chart(fig_d, width='stretch')
 
                     st.markdown('</div>', unsafe_allow_html=True)
     else:
@@ -958,7 +958,7 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
             period_cnt = _all_src.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
             fig = px.bar(period_cnt, x="_Period_label", y="Count", color_discrete_sequence=[PRIMARY])
             fig = chart_layout(fig, "Break Count by Period", "Period", "Count", height=380)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
 
 # ── Tab: Amount Analysis ──────────────────────────────────────────────────────
@@ -1024,7 +1024,7 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
         fig.update_traces(textposition="outside")
         fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
         rec_amt = (
@@ -1042,7 +1042,7 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
         fig2.update_traces(textposition="outside")
         fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=420)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
     elif _amt_view == "By Team" and team_actual and team_actual in df_f.columns:
         team_amt = (
@@ -1059,13 +1059,13 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
         fig3.update_traces(textposition="outside")
         fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=400)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
     else:  # Distribution
         amt_data = df_f[amt_col].dropna()
         fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
         fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=400)
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width='stretch')
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
@@ -1310,7 +1310,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     if HAS_AGGRID:
         gb = GridOptionsBuilder.from_dataframe(summary_df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        gb.configure_default_column(filterable=True, sortable=True, resizable=True,
+        gb.configure_default_column(filter=True, sortable=True, resizable=True,
                                     wrapText=True, autoHeight=True, floatingFilter=True)
         gb.configure_column(selected_label, pinned="left", width=160)
         if "Jira Description" in summary_df.columns:
@@ -1340,7 +1340,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
-        st.dataframe(summary_df, height=500, use_container_width=True)
+        st.dataframe(summary_df, height=500, width='stretch')
 
     # ── Download button right below the table ──
     st.download_button(
@@ -1450,7 +1450,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                         st.info("No ABS GBP column available for Amount metric.")
 
                 if _fig_dd is not None:
-                    st.plotly_chart(_fig_dd, use_container_width=True)
+                    st.plotly_chart(_fig_dd, width='stretch')
 
     st.markdown("---")
 
@@ -1486,51 +1486,92 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             fig.update_traces(textposition="outside")
         fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
                            "Break Count", "", height=max(360, len(top_cnt) * 32))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
-    # ── Chart 2: Top 15 by Avg Age Days (colour-coded by severity) ──
+    # ── Chart 2: Risk Matrix — Age vs Break Count (bubble = ABS GBP) ──
     with row1b:
         if "_Computed_Age_Days" in df.columns:
-            top_age = dq(f"""
+            _abs_expr = (
+                f', ROUND(SUM(ABS("{abs_col}")), 0) AS total_abs'
+                if abs_col and abs_col in df.columns else ""
+            )
+            risk_matrix = dq(f"""
                 SELECT "{dim_col}" AS factor,
-                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age
+                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age,
+                       COUNT(*) AS brk_cnt
+                       {_abs_expr}
                 FROM tbl
                 WHERE "{dim_col}" IS NOT NULL
                   AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
                   AND _Computed_Age_Days IS NOT NULL
-                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 15
-            """, df).sort_values("avg_age", ascending=True)
-            bar_colors = [
-                WARN      if v > 180 else
-                COLORS[8] if v > 90  else
-                COLORS[0]
-                for v in top_age["avg_age"]
-            ]
-            if dmap:
-                top_age["hover_desc"] = top_age["factor"].map(dmap).fillna("")
-                htemplate = "<b>%{y}</b><br>%{customdata}<br>Avg Age: %{x}d<extra></extra>"
-                fig = go.Figure(go.Bar(
-                    x=top_age["avg_age"], y=top_age["factor"],
-                    orientation="h", marker_color=bar_colors,
-                    text=top_age["avg_age"].astype(str) + "d",
-                    textposition="outside",
-                    customdata=top_age["hover_desc"],
-                    hovertemplate=htemplate,
+                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 20
+            """, df)
+
+            if len(risk_matrix) > 0:
+                bubble_colors = [
+                    WARN      if v > 180 else
+                    COLORS[8] if v > 90  else
+                    COLORS[0]
+                    for v in risk_matrix["avg_age"]
+                ]
+                if "total_abs" in risk_matrix.columns:
+                    max_abs = risk_matrix["total_abs"].replace(0, np.nan).max() or 1
+                    bubble_sizes = (
+                        (risk_matrix["total_abs"].fillna(0) / max_abs * 50 + 10)
+                        .clip(10, 60).tolist()
+                    )
+                    size_label = risk_matrix["total_abs"].apply(format_short)
+                else:
+                    bubble_sizes = [20] * len(risk_matrix)
+                    size_label = pd.Series(["N/A"] * len(risk_matrix))
+
+                if dmap:
+                    risk_matrix["hover_desc"] = risk_matrix["factor"].map(dmap).fillna("")
+                    htext = (
+                        "<b>%{customdata[0]}</b><br>%{customdata[1]}<br>"
+                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
+                        "ABS GBP: %{customdata[2]}<extra></extra>"
+                    )
+                    cdata = list(zip(
+                        risk_matrix["factor"],
+                        risk_matrix["hover_desc"],
+                        size_label,
+                    ))
+                else:
+                    htext = (
+                        "<b>%{customdata[0]}</b><br>"
+                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
+                        "ABS GBP: %{customdata[1]}<extra></extra>"
+                    )
+                    cdata = list(zip(risk_matrix["factor"], size_label))
+
+                fig = go.Figure(go.Scatter(
+                    x=risk_matrix["avg_age"],
+                    y=risk_matrix["brk_cnt"],
+                    mode="markers+text",
+                    text=risk_matrix["factor"].apply(
+                        lambda v: (str(v)[:18] + "…") if len(str(v)) > 18 else str(v)
+                    ),
+                    textposition="top center",
+                    textfont=dict(size=9),
+                    marker=dict(
+                        size=bubble_sizes,
+                        color=bubble_colors,
+                        opacity=0.75,
+                        line=dict(width=1, color="white"),
+                    ),
+                    customdata=cdata,
+                    hovertemplate=htext,
                 ))
-            else:
-                fig = go.Figure(go.Bar(
-                    x=top_age["avg_age"], y=top_age["factor"],
-                    orientation="h", marker_color=bar_colors,
-                    text=top_age["avg_age"].astype(str) + "d",
-                    textposition="outside",
-                ))
-            fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
-                          annotation_text="90d",  annotation_position="top right")
-            fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
-                          annotation_text="180d", annotation_position="top right")
-            fig = chart_layout(fig, f"Top 15 {selected_label} by Avg Age Days",
-                               "Avg Age Days", "", height=max(360, len(top_age) * 32))
-            st.plotly_chart(fig, use_container_width=True)
+                fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
+                              annotation_text="90d",  annotation_position="top right")
+                fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
+                              annotation_text="180d", annotation_position="top right")
+                fig = chart_layout(fig,
+                    f"Risk Matrix: {selected_label} — Age vs Break Count",
+                    "Avg Age Days", "Break Count", height=420)
+                fig.update_xaxes(type="linear")
+                st.plotly_chart(fig, width='stretch')
 
     if abs_col and abs_col in df.columns:
         row2a, row2b = st.columns(2)
@@ -1560,7 +1601,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 fig.update_traces(textposition="outside")
             fig = chart_layout(fig, f"Top 15 {selected_label} by Total ABS GBP",
                                "GBP (£)", "", height=max(360, len(top_amt) * 32))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         # ── Chart 4: Top 15 by % Breaks > 90 Days ──
         with row2b:
@@ -1609,7 +1650,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 fig = chart_layout(fig, f"Top 15 {selected_label} — % Breaks > 90 Days",
                                    "% Breaks > 90 Days", "",
                                    height=max(360, len(risk_df) * 32))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
     # ─────────────────────────────────────────────────────────────────────
     # Trend over periods — Top 5, legend annotated with Jira Desc
@@ -1638,7 +1679,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         fig = chart_layout(fig,
             f"Top 5 {selected_label} — Break Count Trend Over Periods",
             "Period", "Break Count")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # ─────────────────────────────────────────────────────────────────────
     # MoM Change — bar chart with hover showing prev/latest counts
@@ -1683,7 +1724,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             f"MoM Break Count Change by {selected_label}  ({prev} → {latest})",
             "Change in Break Count", "",
             height=max(400, len(mom_df) * 28))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         st.caption("🟩 Teal = More breaks this period (worse)   "
                    "🟥 Red = Fewer breaks this period (improvement)")
 
@@ -1732,7 +1773,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             fig = chart_layout(fig,
                 "Jira Reference × System to be Fixed (Top 20 Jiras — Break Count)",
                 "", "", height=max(400, len(pivot) * 30))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
 
@@ -1901,18 +1942,54 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
 
     st.markdown(f"### Priority Ranking by {seg_sel} — Latest: {latest_period}")
 
-    edited = st.data_editor(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
-            "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
-            "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
-            "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
-        },
-        key="_fp_editor",
+    # ── Persist checkbox state across VALUE_CHANGED reruns ────────────────────
+    _tag_key = f"_fp_tags_{seg_sel}"
+    if _tag_key not in st.session_state:
+        st.session_state[_tag_key] = {}
+    display_df = display_df.copy()
+    display_df["Tag for Review"] = display_df[seg_sel].astype(str).map(
+        lambda x: st.session_state[_tag_key].get(x, False)
     )
+
+    if HAS_AGGRID:
+        gb_fp = GridOptionsBuilder.from_dataframe(display_df)
+        gb_fp.configure_default_column(
+            resizable=True, sortable=True, filter=True, floatingFilter=True
+        )
+        gb_fp.configure_column("Tag for Review", editable=True, width=130)
+        gb_fp.configure_column(seg_sel, pinned="left", width=160)
+        if "Top Jira" in display_df.columns:
+            gb_fp.configure_column("Top Jira", width=140)
+        if "Jira Desc" in display_df.columns:
+            gb_fp.configure_column("Jira Desc", width=260)
+        if "System to be Fixed" in display_df.columns:
+            gb_fp.configure_column("System to be Fixed", width=200)
+        gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        fp_grid = AgGrid(
+            display_df,
+            gridOptions=gb_fp.build(),
+            height=480,
+            theme="streamlit",
+            allow_unsafe_jscode=True,
+            key="_fp_priority_grid",
+            update_mode=GridUpdateMode.VALUE_CHANGED,
+        )
+        edited = pd.DataFrame(fp_grid["data"]) if fp_grid["data"] is not None else display_df
+        for _, _row in edited.iterrows():
+            st.session_state[_tag_key][str(_row[seg_sel])] = bool(_row.get("Tag for Review", False))
+    else:
+        edited = st.data_editor(
+            display_df,
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
+                "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
+                "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
+                "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
+            },
+            key="_fp_editor",
+        )
 
     if st.button("Apply Tagged Segments to Filters", key="_fp_apply"):
         confirmed = edited[edited["Tag for Review"] == True]
@@ -1936,7 +2013,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
         fig_t = chart_layout(fig_t, f"ABS GBP Trend — Top 10 by {seg_sel}",
                              "Period", "ABS GBP (£)", height=420)
-        st.plotly_chart(fig_t, use_container_width=True)
+        st.plotly_chart(fig_t, width='stretch')
 
     # Download
     st.download_button(
@@ -2026,7 +2103,7 @@ def tab_period_comparison(df_f: pd.DataFrame, hist_df, col_map: dict) -> None:
                      color_discrete_map={"Historical": COLORS[1], "Current Upload": PRIMARY},
                      barmode="group")
         fig = chart_layout(fig, "Break Count by Period (All Data)", "Period", "Count", height=360)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # ── Waterfall charts ──────────────────────────────────────────────────────
     st.markdown("### Delta Analysis — Current vs Historical Average")
@@ -2069,12 +2146,12 @@ def tab_period_comparison(df_f: pd.DataFrame, hist_df, col_map: dict) -> None:
         if rec_col:
             fig = make_waterfall_chart(rec_col, "Break Count Delta by Rec Name", "count")
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
     with w2:
         if team_col:
             fig = make_waterfall_chart(team_col, "Break Count Delta by Team", "count")
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
     if abs_col and abs_col in df_f.columns:
         w3, w4 = st.columns(2)
@@ -2082,12 +2159,12 @@ def tab_period_comparison(df_f: pd.DataFrame, hist_df, col_map: dict) -> None:
             if rec_col:
                 fig = make_waterfall_chart(rec_col, "ABS GBP Delta by Rec Name", "amount")
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
         with w4:
             if team_col:
                 fig = make_waterfall_chart(team_col, "ABS GBP Delta by Team", "amount")
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
     st.download_button(
         "📥 Download Historical Data (CSV)",
