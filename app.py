@@ -104,6 +104,8 @@ st.markdown(f"""
       border-radius:4px;margin-bottom:.5rem;font-size:.88rem;color:{DARK};}}
   .banner-jira{{background:#E8F4FD;border-left:4px solid #20808D;padding:10px 16px;
       border-radius:4px;margin-bottom:.5rem;font-size:.88rem;color:{DARK};}}
+  .jira-banner{{background:#E3F2FD;border-left:4px solid #1565C0;padding:.6rem 1rem;
+      border-radius:6px;margin-bottom:1rem;font-size:.9rem;}}
   div[data-testid="stButton"]>button{{background-color:{PRIMARY};color:white;
       border:none;font-weight:600;border-radius:6px;padding:8px 24px;}}
   div[data-testid="stButton"]>button:hover{{background-color:#0C4E54;color:white;}}
@@ -343,19 +345,50 @@ def age_to_bucket_vec(age_days: pd.Series) -> pd.Categorical:
 # ── Column mapping ────────────────────────────────────────────────────────────
 
 EXPECTED_COLUMNS = {
-    "Rec Name (as per Rec Cube)": ["rec name", "rec_name", "reconciliation name", "rec cube"],
-    "Team": ["team", "team name", "group"],
-    "Entity": ["entity", "legal entity", "entity name"],
-    "Type of Break": ["type of break", "break type", "break_type"],
-    "Asset Class": ["asset class", "asset_class", "assetclass"],
-    "Date": ["date", "break date", "trade date", "value date"],
-    "Period": ["period", "reporting period", "month"],
+    # Core dimensions
+    "Rec Name (as per Rec Cube)": ["rec name", "rec_name", "reconciliation name", "rec cube", "recs_cube"],
+    "Team":                       ["team", "team name"],
+    "Entity":                     ["entity", "legal entity", "entity name"],
+    "Type of Break":              ["type of break", "break type", "break_type"],
+    "Asset Class":                ["asset class", "asset_class", "assetclass"],
+    "Account Group":              ["account group", "account_group", "acct group"],
+    "Products Reconciled":        ["products reconciled", "products_reconciled"],
+    # Time
+    "Date":     ["date", "break date", "trade date", "value date"],
+    "Period":   ["period", "reporting period"],
     "Age Days": ["age days", "age_days", "days aged", "days old"],
-    "ABS GBP": ["abs gbp", "abs_gbp", "absolute gbp"],
+    # Amounts
+    "ABS GBP":          ["abs gbp", "abs_gbp", "absolute gbp"],
     "BREAK AMOUNT GBP": ["break amount gbp", "break_amount_gbp", "amount gbp", "gbp amount"],
-    "Jira Flag": ["jira flag", "jira_flag", "has jira", "jira"],
-    "Jira ID": ["jira id", "jira_id", "ticket id", "ticket"],
-    "Comments": ["comments", "comment", "notes", "note"],
+    "BREAK AMOUNT CCY": ["break amount ccy", "break_amount_ccy"],
+    "Threshold":        ["threshold"],
+    "ABS GBP GT 1MN":   ["abs gbp(greater than 1mn)", "abs gbp (greater than 1mn)", "abs gbp>1mn"],
+    # Jira & issue tracking
+    "Jira Reference":     ["jira reference", "jira ref", "jira_reference", "jira_ref"],
+    "Jira Desc":          ["jira desc", "jira description", "jira_desc"],
+    "System to be Fixed": ["system to be fixed", "system_to_be_fixed", "system fix"],
+    "ISSUE CATEGORY":     ["issue category", "issue_category"],
+    "ISSUE CATEGORY2":    ["issue category2", "issue_category2"],
+    "JIRA PRIORITY":      ["jira priority", "jira_priority"],
+    "EPIC":               ["epic"],
+    "EPIC DESC":          ["epic desc", "epic_desc", "epic description"],
+    "High Level Product": ["high level product", "high_level_product"],
+    "FIX REQUIRED":       ["fix required", "fix_required"],
+    "ISSUE RAG RATING":   ["issue rag rating", "rag rating", "rag_rating"],
+    # Classification
+    "True/Systemic Breaks":  ["true/systemic", "true systemic", "systemic"],
+    "Journals Posted":       ["journals posted", "journals_posted"],
+    "Thematic":              ["thematic"],
+    "Type of issue":         ["type of issue", "issue type"],
+    "Action":                ["action"],
+    "Root Cause identified": ["root cause", "root_cause"],
+    "B/S Cert":              ["b/s cert", "bs cert"],
+    # Trade fields
+    "TRADE REF":      ["trade ref", "trade_ref"],
+    "TRADE CCY":      ["trade ccy", "trade_ccy"],
+    "RECS_CUBE_NAME": ["recs_cube_name", "recs cube name"],
+    # Misc
+    "Comments":      ["comments", "comment", "notes", "note"],
     "_FP_Confirmed": ["_fp_confirmed", "fp confirmed", "false positive confirmed"],
 }
 
@@ -394,14 +427,21 @@ def run_pipeline(raw_bytes: bytes) -> dict:
         col_map = build_col_map(df)
         return {"df": df, "col_map": col_map, "fhash": fhash, "overflow_count": 0, "cached": True}
 
-    # Parse raw bytes
-    try:
-        df = pd.read_excel(BytesIO(raw_bytes), engine="openpyxl")
-    except Exception:
+    # Parse raw bytes — detect Parquet magic bytes (PAR1) first for fast loading
+    if raw_bytes[:4] == b"PAR1":
         try:
-            df = pd.read_csv(BytesIO(raw_bytes))
+            df = pd.read_parquet(BytesIO(raw_bytes))
         except Exception as e:
-            st.error(f"Cannot parse file: {e}")
+            st.error(f"Cannot parse Parquet file: {e}")
+            st.stop()
+    else:
+        try:
+            df = pd.read_excel(BytesIO(raw_bytes), engine="openpyxl")
+        except Exception:
+            try:
+                df = pd.read_csv(BytesIO(raw_bytes))
+            except Exception as e:
+                st.error(f"Cannot parse file: {e}")
             st.stop()
 
     df = drop_blank_trailing(df)
@@ -974,94 +1014,547 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
 
-def tab_jira_factor_analysis(df_f: pd.DataFrame, col_map: dict) -> None:
-    st.markdown("## 🔍 Jira Factor Analysis")
+def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
+    """
+    Factor Analysis using Jira Reference (Jira Desc as lookup attribute — not a dimension)
+    and System to be Fixed.
 
-    jira_flag_actual = col_map.get("Jira Flag")
-    jira_id_actual   = col_map.get("Jira ID")
-
-    if not jira_flag_actual and not jira_id_actual:
-        st.info("No Jira Flag or Jira ID column found.")
-        return
-
-    # Derive jira mask
-    if jira_flag_actual and jira_flag_actual in df_f.columns:
-        jira_mask = df_f[jira_flag_actual].astype(str).str.lower().isin(
-            ["true", "yes", "y", "1", "x"])
-    elif jira_id_actual and jira_id_actual in df_f.columns:
-        jira_mask = df_f[jira_id_actual].notna() & (df_f[jira_id_actual].astype(str).str.strip() != "")
-    else:
-        st.info("Jira column found but has no usable data.")
-        return
-
-    with_jira = int(jira_mask.sum())
-    without_jira = len(df_f) - with_jira
-    jira_pct = with_jira / max(len(df_f), 1) * 100
-
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        kpi_card("Breaks with Jira", format_number(with_jira), f"{jira_pct:.1f}% of total")
-    with k2:
-        kpi_card("Breaks without Jira", format_number(without_jira))
-    with k3:
-        if "_Computed_Age_Days" in df_f.columns:
-            avg_age_jira    = df_f[jira_mask]["_Computed_Age_Days"].mean()
-            avg_age_nojira  = df_f[~jira_mask]["_Computed_Age_Days"].mean()
-            kpi_card("Avg Age (Jira)", format_number(avg_age_jira, 1))
-
-    st.markdown("---")
+    Attribute roles:
+      Jira Reference      → GROUP BY dimension (primary key)
+      Jira Desc           → Lookup attribute shown as column alongside Jira Reference
+      System to be Fixed  → GROUP BY dimension (separate factor)
+      Rec Name            → GROUP BY dimension; Account Group / Products as lookup attrs
+      TRADE REF           → Row identifier — never grouped
+    """
+    st.markdown("## Jira Factor Analysis")
     st.markdown(
-        '<div class="banner-jira">💡 Jira tickets indicate escalated breaks. '
-        'High Jira % may signal systemic issues requiring operational review.</div>',
+        '<div class="jira-banner">🔍 <b>Factor Analysis:</b> Jira Reference and System to be Fixed '
+        'are the primary break driver dimensions. Jira Description is shown as a reference '
+        'attribute alongside each ticket — not grouped separately as it is 1:1 with Jira Reference. '
+        'Similarly, Account Group and Products are shown as lookup attributes on Rec Name.</div>',
         unsafe_allow_html=True)
 
-    # Pie chart
-    pie_data = pd.DataFrame({
-        "Category": ["With Jira", "Without Jira"],
-        "Count": [with_jira, without_jira],
+    # ── Resolve columns ──
+    jira_ref_col   = col_map.get("Jira Reference")
+    jira_desc_col  = col_map.get("Jira Desc")
+    system_col     = col_map.get("System to be Fixed")
+    abs_col        = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    team_col       = col_map.get("Team")
+    rec_col        = col_map.get("Rec Name (as per Rec Cube)")
+    ac_col         = col_map.get("Asset Class")
+    entity_col     = col_map.get("Entity")
+    ts_col         = col_map.get("True/Systemic Breaks")
+    acct_grp_col   = col_map.get("Account Group")
+    products_col   = col_map.get("Products Reconciled")
+
+    # ── Dimension selector — Jira Desc excluded (it is a lookup, not a dimension) ──
+    factor_options = {}
+    if jira_ref_col and jira_ref_col in df.columns:
+        factor_options["Jira Reference"]     = jira_ref_col
+    if system_col   and system_col   in df.columns:
+        factor_options["System to be Fixed"] = system_col
+
+    extra_dims = {k: v for k, v in {
+        "Team":          team_col,
+        "Rec Name":      rec_col,
+        "Asset Class":   ac_col,
+        "Entity":        entity_col,
+        "True/Systemic": ts_col,
+    }.items() if v and v in df.columns}
+
+    all_dims = {**factor_options, **extra_dims}
+
+    if not all_dims:
+        st.info("No Jira or dimension columns found. Check that the file contains "
+                "'Jira reference', 'JIRA DESC', 'SYSTEM TO BE FIXED'.")
+        return
+
+    # ── Coverage KPIs for Jira columns ──
+    coverage_cols = {k: v for k, v in {
+        "Jira Reference":     jira_ref_col,
+        "Jira Description":   jira_desc_col,
+        "System to be Fixed": system_col,
+    }.items() if v and v in df.columns}
+
+    if coverage_cols:
+        st.markdown("### Jira Column Coverage")
+        cov_cols_ui = st.columns(len(coverage_cols))
+        for i, (label, col) in enumerate(coverage_cols.items()):
+            filled = dq(f"""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (
+                           WHERE "{col}" IS NOT NULL
+                           AND TRIM(CAST("{col}" AS VARCHAR))
+                               NOT IN ('','nan','None','N/A','-')
+                       ) AS populated
+                FROM tbl
+            """, df).iloc[0]
+            pct = round(int(filled["populated"]) / max(int(filled["total"]), 1) * 100, 1)
+            with cov_cols_ui[i]:
+                kpi_card(f"{label} Coverage", f"{pct}%",
+                         f"{format_number(filled['populated'])} / {format_number(filled['total'])} rows",
+                         warn=(pct < 50))
+
+    st.markdown("---")
+
+    # ── Dimension selector ──
+    selected_label = st.selectbox(
+        "Select Factor Dimension",
+        list(all_dims.keys()),
+        key="jira_dim_sel",
+        help="Jira Description is not listed here — it appears as a lookup column "
+             "in the summary table when Jira Reference is selected.",
+    )
+    dim_col = all_dims[selected_label]
+
+    period_order = (sorted(df["_Period_label"].dropna().unique().tolist())
+                    if "_Period_label" in df.columns else [])
+    latest = period_order[-1] if period_order else "0"
+    prev   = period_order[-2] if len(period_order) >= 2 else "0"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Helper: build a Jira Desc / System lookup dict for annotations
+    # ─────────────────────────────────────────────────────────────────────
+    def _desc_map() -> dict:
+        """Jira Reference → Jira Desc  (first non-null per ref)."""
+        if not (jira_desc_col and jira_desc_col in df.columns): return {}
+        return (dq(f"""
+            SELECT "{jira_ref_col}" AS ref,
+                   FIRST("{jira_desc_col}") AS d
+            FROM tbl
+            WHERE "{jira_ref_col}" IS NOT NULL
+            GROUP BY "{jira_ref_col}"
+        """, df).set_index("ref")["d"].to_dict())
+
+    def _short_label(ref: str, dmap: dict, max_chars: int = 38) -> str:
+        desc = str(dmap.get(ref, ""))
+        if not desc or desc in ("nan", "None", "N/A", "-"): return str(ref)
+        return f"{ref}: {desc[:max_chars]}{'…' if len(desc) > max_chars else ''}"
+
+    # ── Factor Summary Table ──
+    st.markdown(f"### {selected_label} — Factor Summary Table")
+
+    # Lookup attribute expressions per selected dimension
+    lookup_exprs = ""
+    if selected_label == "Jira Reference":
+        if jira_desc_col and jira_desc_col in df.columns:
+            lookup_exprs += f', FIRST("{jira_desc_col}") AS "Jira Description"'
+        if system_col and system_col in df.columns:
+            lookup_exprs += f', FIRST("{system_col}") AS "System to be Fixed"'
+    elif selected_label == "System to be Fixed":
+        if jira_ref_col and jira_ref_col in df.columns:
+            lookup_exprs += f', COUNT(DISTINCT "{jira_ref_col}") AS "Unique Jira Refs"'
+    elif selected_label == "Rec Name":
+        if acct_grp_col and acct_grp_col in df.columns:
+            lookup_exprs += f', FIRST("{acct_grp_col}") AS "Account Group"'
+        if products_col and products_col in df.columns:
+            lookup_exprs += f', FIRST("{products_col}") AS "Products Reconciled"'
+
+    age_expr = (
+        'ROUND(AVG(_Computed_Age_Days), 1) AS "Avg Age Days",'
+        'MAX(_Computed_Age_Days)           AS "Max Age Days",'
+        if "_Computed_Age_Days" in df.columns else ""
+    )
+    amount_expr = (
+        f'ROUND(SUM(ABS("{abs_col}")), 0) AS "Total ABS GBP",'
+        if abs_col and abs_col in df.columns else ""
+    )
+    over_expr = (
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 90)  AS ">90d",'
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 180) AS ">180d",'
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS ">365d",'
+        if "_Computed_Age_Days" in df.columns else ""
+    )
+    period_expr = (
+        f'COUNT(*) FILTER (WHERE _Period_label = \'{latest}\') AS "Latest Period",'
+        f'COUNT(*) FILTER (WHERE _Period_label = \'{prev}\')   AS "Prev Period"'
+        if period_order else
+        '0 AS "Latest Period", 0 AS "Prev Period"'
+    )
+
+    summary_df = dq(f"""
+        SELECT
+            "{dim_col}"  AS "{selected_label}",
+            COUNT(*)     AS "Break Count"
+            {lookup_exprs},
+            {age_expr}
+            {amount_expr}
+            {over_expr}
+            {period_expr}
+        FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+          AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+        GROUP BY "{dim_col}"
+        ORDER BY "Break Count" DESC
+    """, df)
+
+    # ── Derived / enriched columns ──
+    if "Total ABS GBP" in summary_df.columns:
+        summary_df["Avg GBP / Break"] = (
+            summary_df["Total ABS GBP"] /
+            summary_df["Break Count"].replace(0, np.nan)
+        ).round(0)
+        summary_df["Total ABS GBP"]   = summary_df["Total ABS GBP"].apply(format_short)
+        summary_df["Avg GBP / Break"] = summary_df["Avg GBP / Break"].apply(format_short)
+
+    if ">90d" in summary_df.columns:
+        summary_df[">90 Day %"] = (
+            summary_df[">90d"] /
+            summary_df["Break Count"].replace(0, np.nan) * 100
+        ).round(1)
+
+    if "Latest Period" in summary_df.columns and "Prev Period" in summary_df.columns:
+        summary_df["MoM Δ"]   = summary_df["Latest Period"] - summary_df["Prev Period"]
+        summary_df["MoM Δ %"] = (
+            (summary_df["MoM Δ"] /
+             summary_df["Prev Period"].replace(0, np.nan)) * 100
+        ).round(1)
+
+    # ── Column order — Jira Desc always immediately after Jira Reference ──
+    col_order = [selected_label]
+    for c in ["Jira Description", "System to be Fixed", "Account Group",
+              "Products Reconciled", "Unique Jira Refs"]:
+        if c in summary_df.columns: col_order.append(c)
+    for c in ["Break Count", "Latest Period", "Prev Period", "MoM Δ", "MoM Δ %",
+              "Avg Age Days", "Max Age Days",
+              ">90d", ">90 Day %", ">180d", ">365d",
+              "Total ABS GBP", "Avg GBP / Break"]:
+        if c in summary_df.columns: col_order.append(c)
+    summary_df = summary_df[[c for c in col_order if c in summary_df.columns]]
+
+    # ── Rename >90d etc. for display ──
+    summary_df = summary_df.rename(columns={
+        ">90d":  ">90 Day Breaks",
+        ">180d": ">180 Day Breaks",
+        ">365d": ">365 Day Breaks",
     })
-    fig_pie = px.pie(pie_data, names="Category", values="Count",
-                     color_discrete_sequence=[WARN, PRIMARY])
-    fig_pie = chart_layout(fig_pie, "Jira Coverage", height=360)
-    st.plotly_chart(fig_pie, use_container_width=True)
 
-    # Jira rate by team
-    team_actual = col_map.get("Team")
-    if team_actual and team_actual in df_f.columns:
-        st.markdown("### Jira Rate by Team")
-        team_jira = df_f.groupby(team_actual).apply(
-            lambda g: pd.Series({
-                "Total": len(g),
-                "With Jira": int(jira_mask.loc[g.index].sum()),
-            })
-        ).reset_index()
-        team_jira["Jira Rate %"] = team_jira["With Jira"] / team_jira["Total"].clip(lower=1) * 100
-        fig_tj = px.bar(
-            team_jira, x=team_actual, y="Jira Rate %",
-            color_discrete_sequence=[WARN],
-            text=[f"{v:.1f}%" for v in team_jira["Jira Rate %"]],
-        )
-        fig_tj.update_traces(textposition="outside")
-        fig_tj = chart_layout(fig_tj, "Jira Rate (%) by Team", team_actual, "Jira Rate %", height=360)
-        st.plotly_chart(fig_tj, use_container_width=True)
+    # ── AgGrid with rich conditional formatting ──
+    if HAS_AGGRID:
+        gb = GridOptionsBuilder.from_dataframe(summary_df)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        gb.configure_default_column(filterable=True, sortable=True, resizable=True,
+                                    wrapText=True, autoHeight=True)
+        gb.configure_column(selected_label, pinned="left", width=160)
+        if "Jira Description" in summary_df.columns:
+            gb.configure_column("Jira Description", width=300,
+                                tooltipField="Jira Description")
+        if "System to be Fixed" in summary_df.columns:
+            gb.configure_column("System to be Fixed", width=200)
+        for c in ["Break Count", "Latest Period", "Prev Period"]:
+            if c in summary_df.columns:
+                gb.configure_column(c, width=120)
+        if "MoM Δ" in summary_df.columns:
+            mom_cs = JsCode("""function(p){
+                var v=p.value;
+                if(v > 0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                if(v < 0) return {'backgroundColor':'#E8F5E9','color':'#01696F','fontWeight':'bold'};
+                return {};}""")
+            gb.configure_column("MoM Δ",   cellStyle=mom_cs, width=90)
+            gb.configure_column("MoM Δ %", cellStyle=mom_cs, width=100)
+        if ">90 Day %" in summary_df.columns:
+            risk_cs = JsCode("""function(p){
+                var v=parseFloat(p.value);
+                if(v>=50) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
+                return {};}""")
+            gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
+        AgGrid(summary_df, gridOptions=gb.build(), height=440,
+               theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid")
+    else:
+        st.dataframe(summary_df, height=440, use_container_width=True)
 
-    # Jira rate by period
-    if "_Period_label" in df_f.columns:
-        st.markdown("### Jira Rate Trend by Period")
-        df_jira_trend = df_f.copy()
-        df_jira_trend["_has_jira"] = jira_mask.astype(int)
-        period_jira = (
-            df_jira_trend.groupby("_Period_label")
-            .agg(total=("_has_jira","count"), with_jira=("_has_jira","sum"))
-            .reset_index()
-        )
-        period_jira["Jira Rate %"] = period_jira["with_jira"] / period_jira["total"].clip(lower=1) * 100
-        fig_pj = px.line(
-            period_jira, x="_Period_label", y="Jira Rate %",
-            markers=True, color_discrete_sequence=[WARN],
-        )
-        fig_pj = chart_layout(fig_pj, "Jira Rate (%) by Period", "Period", "Jira Rate %", height=340)
-        st.plotly_chart(fig_pj, use_container_width=True)
+    # ── Download button right below the table ──
+    st.download_button(
+        f"📥 Download {selected_label} Factor Summary (CSV)",
+        summary_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Visual panels — 4 charts in 2×2 grid
+    # ─────────────────────────────────────────────────────────────────────
+    dmap = _desc_map() if selected_label == "Jira Reference" else {}
+
+    row1a, row1b = st.columns(2)
+
+    # ── Chart 1: Top 15 by Break Count ──
+    with row1a:
+        top_cnt = dq(f"""
+            SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
+        """, df).sort_values("cnt", ascending=True)
+
+        if dmap:
+            top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
+            fig = go.Figure(go.Bar(
+                x=top_cnt["cnt"], y=top_cnt["factor"],
+                orientation="h", marker_color=PRIMARY,
+                text=top_cnt["cnt"], textposition="outside",
+                customdata=top_cnt["hover_desc"],
+                hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
+            ))
+        else:
+            fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
+                         color_discrete_sequence=[PRIMARY], text="cnt")
+            fig.update_traces(textposition="outside")
+        fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
+                           "Break Count", "", height=max(360, len(top_cnt) * 32))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Chart 2: Top 15 by Avg Age Days (colour-coded by severity) ──
+    with row1b:
+        if "_Computed_Age_Days" in df.columns:
+            top_age = dq(f"""
+                SELECT "{dim_col}" AS factor,
+                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                  AND _Computed_Age_Days IS NOT NULL
+                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 15
+            """, df).sort_values("avg_age", ascending=True)
+            bar_colors = [
+                WARN      if v > 180 else
+                COLORS[8] if v > 90  else
+                COLORS[0]
+                for v in top_age["avg_age"]
+            ]
+            if dmap:
+                top_age["hover_desc"] = top_age["factor"].map(dmap).fillna("")
+                htemplate = "<b>%{y}</b><br>%{customdata}<br>Avg Age: %{x}d<extra></extra>"
+                fig = go.Figure(go.Bar(
+                    x=top_age["avg_age"], y=top_age["factor"],
+                    orientation="h", marker_color=bar_colors,
+                    text=top_age["avg_age"].astype(str) + "d",
+                    textposition="outside",
+                    customdata=top_age["hover_desc"],
+                    hovertemplate=htemplate,
+                ))
+            else:
+                fig = go.Figure(go.Bar(
+                    x=top_age["avg_age"], y=top_age["factor"],
+                    orientation="h", marker_color=bar_colors,
+                    text=top_age["avg_age"].astype(str) + "d",
+                    textposition="outside",
+                ))
+            fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
+                          annotation_text="90d",  annotation_position="top right")
+            fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
+                          annotation_text="180d", annotation_position="top right")
+            fig = chart_layout(fig, f"Top 15 {selected_label} by Avg Age Days",
+                               "Avg Age Days", "", height=max(360, len(top_age) * 32))
+            st.plotly_chart(fig, use_container_width=True)
+
+    if abs_col and abs_col in df.columns:
+        row2a, row2b = st.columns(2)
+
+        # ── Chart 3: Top 15 by ABS GBP ──
+        with row2a:
+            top_amt = dq(f"""
+                SELECT "{dim_col}" AS factor, SUM(ABS("{abs_col}")) AS total
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                GROUP BY "{dim_col}" ORDER BY total DESC LIMIT 15
+            """, df).sort_values("total", ascending=True)
+            top_amt["label"] = top_amt["total"].apply(format_short)
+            if dmap:
+                top_amt["hover_desc"] = top_amt["factor"].map(dmap).fillna("")
+                fig = go.Figure(go.Bar(
+                    x=top_amt["total"], y=top_amt["factor"],
+                    orientation="h", marker_color=COLORS[2],
+                    text=top_amt["label"], textposition="outside",
+                    customdata=top_amt["hover_desc"],
+                    hovertemplate="<b>%{y}</b><br>%{customdata}<br>ABS GBP: %{text}<extra></extra>",
+                ))
+            else:
+                fig = px.bar(top_amt, x="total", y="factor", orientation="h",
+                             color_discrete_sequence=[COLORS[2]], text="label")
+                fig.update_traces(textposition="outside")
+            fig = chart_layout(fig, f"Top 15 {selected_label} by Total ABS GBP",
+                               "GBP (£)", "", height=max(360, len(top_amt) * 32))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Chart 4: Top 15 by % Breaks > 90 Days ──
+        with row2b:
+            if "_Computed_Age_Days" in df.columns:
+                risk_df = dq(f"""
+                    SELECT "{dim_col}" AS factor,
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE _Computed_Age_Days > 90) AS over90
+                    FROM tbl
+                    WHERE "{dim_col}" IS NOT NULL
+                      AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                      AND _Computed_Age_Days IS NOT NULL
+                    GROUP BY "{dim_col}" ORDER BY over90 DESC LIMIT 15
+                """, df)
+                risk_df[">90 Day %"] = (
+                    risk_df["over90"] / risk_df["total"].replace(0, np.nan) * 100
+                ).round(1)
+                risk_df = risk_df.sort_values(">90 Day %", ascending=True)
+                risk_colors = [
+                    WARN      if v >= 50 else
+                    COLORS[8] if v >= 25 else
+                    COLORS[0]
+                    for v in risk_df[">90 Day %"]
+                ]
+                if dmap:
+                    risk_df["hover_desc"] = risk_df["factor"].map(dmap).fillna("")
+                    fig = go.Figure(go.Bar(
+                        x=risk_df[">90 Day %"], y=risk_df["factor"],
+                        orientation="h", marker_color=risk_colors,
+                        text=risk_df[">90 Day %"].astype(str) + "%",
+                        textposition="outside",
+                        customdata=risk_df["hover_desc"],
+                        hovertemplate="<b>%{y}</b><br>%{customdata}<br>>90d: %{x}%<extra></extra>",
+                    ))
+                else:
+                    fig = go.Figure(go.Bar(
+                        x=risk_df[">90 Day %"], y=risk_df["factor"],
+                        orientation="h", marker_color=risk_colors,
+                        text=risk_df[">90 Day %"].astype(str) + "%",
+                        textposition="outside",
+                    ))
+                fig.add_vline(x=25, line_dash="dash", line_color=COLORS[8], line_width=1.2,
+                              annotation_text="25%", annotation_position="top right")
+                fig.add_vline(x=50, line_dash="dash", line_color=WARN,      line_width=1.2,
+                              annotation_text="50%", annotation_position="top right")
+                fig = chart_layout(fig, f"Top 15 {selected_label} — % Breaks > 90 Days",
+                                   "% Breaks > 90 Days", "",
+                                   height=max(360, len(risk_df) * 32))
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Trend over periods — Top 5, legend annotated with Jira Desc
+    # ─────────────────────────────────────────────────────────────────────
+    if "_Period_label" in df.columns and period_order:
+        st.markdown(f"### {selected_label} — Break Count Trend Over Periods (Top 5)")
+        top5 = dq(f"""
+            SELECT "{dim_col}" AS factor FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
+        """, df)["factor"].tolist()
+        top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
+        trend_df = dq(f"""
+            SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl WHERE "{dim_col}" IN ({top5_str})
+            GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
+        """, df)
+        if dmap:
+            trend_df["factor_label"] = trend_df["factor"].apply(
+                lambda x: _short_label(x, dmap, max_chars=40))
+        else:
+            trend_df["factor_label"] = trend_df["factor"]
+        fig = px.line(trend_df, x="period", y="cnt", color="factor_label",
+                      color_discrete_sequence=COLORS, markers=True)
+        fig = chart_layout(fig,
+            f"Top 5 {selected_label} — Break Count Trend Over Periods",
+            "Period", "Break Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MoM Change — bar chart with hover showing prev/latest counts
+    # ─────────────────────────────────────────────────────────────────────
+    if len(period_order) >= 2:
+        st.markdown(f"### MoM Change by {selected_label}  ({prev} → {latest})")
+        mom_df = dq(f"""
+            SELECT "{dim_col}" AS factor,
+                   COUNT(*) FILTER (WHERE _Period_label='{latest}') AS lat,
+                   COUNT(*) FILTER (WHERE _Period_label='{prev}')   AS prv
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}"
+            HAVING (lat > 0 OR prv > 0)
+        """, df)
+        mom_df["delta"] = mom_df["lat"] - mom_df["prv"]
+        mom_df = mom_df.sort_values("delta")
+        colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["delta"]]
+        if dmap:
+            mom_df["y_label"] = mom_df["factor"].apply(
+                lambda x: _short_label(x, dmap, max_chars=35))
+        else:
+            mom_df["y_label"] = mom_df["factor"]
+        fig = go.Figure(go.Bar(
+            x=mom_df["delta"],
+            y=mom_df["y_label"],
+            orientation="h",
+            marker_color=colors_mom,
+            text=mom_df["delta"].apply(lambda x: f"+{int(x)}" if x >= 0 else str(int(x))),
+            textposition="outside",
+            customdata=np.stack([mom_df["prv"], mom_df["lat"]], axis=-1),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Prev Period: %{customdata[0]}<br>"
+                "Latest Period: %{customdata[1]}<br>"
+                "Δ: %{x}<extra></extra>"
+            ),
+        ))
+        fig.add_vline(x=0, line_dash="dash", line_color=MUTED, line_width=1)
+        fig = chart_layout(fig,
+            f"MoM Break Count Change by {selected_label}  ({prev} → {latest})",
+            "Change in Break Count", "",
+            height=max(400, len(mom_df) * 28))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("🟩 Teal = More breaks this period (worse)   "
+                   "🟥 Red = Fewer breaks this period (improvement)")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Jira Reference × System to be Fixed heatmap
+    # ─────────────────────────────────────────────────────────────────────
+    if (jira_ref_col  and jira_ref_col  in df.columns and
+            system_col and system_col in df.columns):
+        st.markdown("### Jira Reference × System to be Fixed — Break Count Heatmap")
+        cross = dq(f"""
+            SELECT "{jira_ref_col}" AS jira_ref,
+                   "{system_col}"   AS system_fix,
+                   COUNT(*)         AS cnt
+            FROM tbl
+            WHERE "{jira_ref_col}" IS NOT NULL AND "{system_col}" IS NOT NULL
+              AND TRIM(CAST("{jira_ref_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+              AND TRIM(CAST("{system_col}"   AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{jira_ref_col}", "{system_col}"
+        """, df)
+
+        if len(cross) > 0:
+            if jira_desc_col and jira_desc_col in df.columns:
+                desc_map_h = dq(f"""
+                    SELECT "{jira_ref_col}" AS ref,
+                           FIRST("{jira_desc_col}") AS d
+                    FROM tbl WHERE "{jira_ref_col}" IS NOT NULL
+                    GROUP BY "{jira_ref_col}"
+                """, df).set_index("ref")["d"].to_dict()
+                cross["jira_label"] = cross["jira_ref"].apply(
+                    lambda x: _short_label(x, desc_map_h, max_chars=30))
+            else:
+                cross["jira_label"] = cross["jira_ref"]
+
+            pivot = cross.pivot_table(
+                index="jira_label", columns="system_fix",
+                values="cnt", fill_value=0)
+            jira_totals = cross.groupby("jira_label")["cnt"].sum()
+            top20_labels = jira_totals.nlargest(20).index
+            pivot = pivot.loc[pivot.index.isin(top20_labels)]
+
+            fig = px.imshow(
+                pivot,
+                color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
+                aspect="auto", text_auto=".0f",
+            )
+            fig = chart_layout(fig,
+                "Jira Reference × System to be Fixed (Top 20 Jiras — Break Count)",
+                "", "", height=max(400, len(pivot) * 30))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
 
 
 # ── Tab: FP Thresholding ──────────────────────────────────────────────────────
@@ -1361,39 +1854,70 @@ def main():
 
     # Sidebar: file upload
     st.sidebar.markdown("## Upload Data")
-    uploaded = st.sidebar.file_uploader(
-        "Upload Excel or CSV file",
-        type=["xlsx", "xls", "csv"],
-        key="_file_uploader",
+    st.sidebar.caption(
+        "Upload the current period file (required). Optionally upload a historical "
+        "file with previous periods to enable trend comparison."
+    )
+
+    uploaded_latest = st.sidebar.file_uploader(
+        "📂 Latest Period File",
+        type=["xlsx", "xls", "csv", "parquet"],
+        key="_file_latest",
+        help="Current period's reconciliation break data (Excel, CSV, or Parquet).",
+    )
+
+    uploaded_hist = st.sidebar.file_uploader(
+        "📂 Historical Data (optional)",
+        type=["xlsx", "xls", "csv", "parquet"],
+        key="_file_hist",
+        help="Previous periods file for Period Comparison tab. Can contain multiple periods.",
     )
 
     if st.sidebar.button("Reset Filters", key="_reset_btn"):
         _reset_filters()
         st.rerun()
 
-    if uploaded is None:
+    if uploaded_latest is None:
         st.markdown(
-            '<div class="banner-info">👆 Upload an Excel or CSV file in the sidebar to begin analysis.</div>',
+            '<div class="banner-info">👆 Upload the <b>Latest Period File</b> in the sidebar to begin analysis.</div>',
             unsafe_allow_html=True)
         st.stop()
 
-    raw_bytes = uploaded.read()
-    result = run_pipeline(raw_bytes)
+    with st.spinner("Processing latest period file..."):
+        raw_bytes = uploaded_latest.read()
+        result = run_pipeline(raw_bytes)
 
     df      = result["df"]
     col_map = result["col_map"]
 
-    # Set overflow in session state (Change 3)
+    # Set overflow in session state
     st.session_state["_overflow"] = result["overflow_count"]
 
     if result.get("cached"):
-        st.sidebar.markdown(
-            '<div class="banner-info" style="font-size:.78rem;">⚡ Loaded from cache.</div>',
-            unsafe_allow_html=True)
+        st.sidebar.success("⚡ Loaded from cache.")
 
-    # Load historical context for period comparison (Change 12)
-    current_periods = df["_Period_label"].dropna().unique().tolist() if "_Period_label" in df.columns else []
-    hist_df = load_historical_context(current_periods, result["fhash"])
+    # Parquet download button — lets users save the converted file for fast re-upload
+    pq_path = _pq_path(result["fhash"])
+    if os.path.exists(pq_path):
+        with open(pq_path, "rb") as _f:
+            _pq_bytes = _f.read()
+        st.sidebar.download_button(
+            label="⬇️ Download as Parquet",
+            data=_pq_bytes,
+            file_name=f"breaks_{result['fhash'][:8]}.parquet",
+            mime="application/octet-stream",
+            help="Download the cached Parquet file for instant re-upload next time.",
+        )
+
+    # Historical data: explicit upload takes priority over auto-cached periods
+    if uploaded_hist is not None:
+        with st.spinner("Processing historical file..."):
+            hist_bytes = uploaded_hist.read()
+            hist_result = run_pipeline(hist_bytes)
+        hist_df = hist_result["df"]
+    else:
+        current_periods = df["_Period_label"].dropna().unique().tolist() if "_Period_label" in df.columns else []
+        hist_df = load_historical_context(current_periods, result["fhash"])
 
     # Build filters and apply
     filters = build_sidebar_filters(df, col_map)
