@@ -1310,7 +1310,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     if HAS_AGGRID:
         gb = GridOptionsBuilder.from_dataframe(summary_df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        gb.configure_default_column(filterable=True, sortable=True, resizable=True,
+        gb.configure_default_column(filter=True, sortable=True, resizable=True,
                                     wrapText=True, autoHeight=True, floatingFilter=True)
         gb.configure_column(selected_label, pinned="left", width=160)
         if "Jira Description" in summary_df.columns:
@@ -1901,18 +1901,54 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
 
     st.markdown(f"### Priority Ranking by {seg_sel} — Latest: {latest_period}")
 
-    edited = st.data_editor(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
-            "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
-            "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
-            "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
-        },
-        key="_fp_editor",
+    # ── Persist checkbox state across VALUE_CHANGED reruns ────────────────────
+    _tag_key = f"_fp_tags_{seg_sel}"
+    if _tag_key not in st.session_state:
+        st.session_state[_tag_key] = {}
+    display_df = display_df.copy()
+    display_df["Tag for Review"] = display_df[seg_sel].astype(str).map(
+        lambda x: st.session_state[_tag_key].get(x, False)
     )
+
+    if HAS_AGGRID:
+        gb_fp = GridOptionsBuilder.from_dataframe(display_df)
+        gb_fp.configure_default_column(
+            resizable=True, sortable=True, filter=True, floatingFilter=True
+        )
+        gb_fp.configure_column("Tag for Review", editable=True, width=130)
+        gb_fp.configure_column(seg_sel, pinned="left", width=160)
+        if "Top Jira" in display_df.columns:
+            gb_fp.configure_column("Top Jira", width=140)
+        if "Jira Desc" in display_df.columns:
+            gb_fp.configure_column("Jira Desc", width=260)
+        if "System to be Fixed" in display_df.columns:
+            gb_fp.configure_column("System to be Fixed", width=200)
+        gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        fp_grid = AgGrid(
+            display_df,
+            gridOptions=gb_fp.build(),
+            height=480,
+            theme="streamlit",
+            allow_unsafe_jscode=True,
+            key="_fp_priority_grid",
+            update_mode=GridUpdateMode.VALUE_CHANGED,
+        )
+        edited = pd.DataFrame(fp_grid["data"]) if fp_grid["data"] is not None else display_df
+        for _, _row in edited.iterrows():
+            st.session_state[_tag_key][str(_row[seg_sel])] = bool(_row.get("Tag for Review", False))
+    else:
+        edited = st.data_editor(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
+                "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
+                "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
+                "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
+            },
+            key="_fp_editor",
+        )
 
     if st.button("Apply Tagged Segments to Filters", key="_fp_apply"):
         confirmed = edited[edited["Tag for Review"] == True]
