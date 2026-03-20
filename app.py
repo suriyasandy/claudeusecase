@@ -37,10 +37,12 @@ ALL EXISTING FIXES RETAINED:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from datetime import date as _date
 from io import BytesIO
@@ -57,6 +59,12 @@ try:
     HAS_AGGRID = True
 except ImportError:
     HAS_AGGRID = False
+
+try:
+    from jira import Jira as _JiraClient
+    HAS_JIRA = True
+except ImportError:
+    HAS_JIRA = False
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -202,11 +210,47 @@ def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(resizable=True, sortable=True, filter=True, floatingFilter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb, df.columns.tolist())
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(df, width='stretch', height=height)
+
+
+# ── Computed-column header styling ────────────────────────────────────────────
+_COMPUTED_HEADER_COLS = frozenset({
+    # Summary / Ageing aggregates
+    "Break Count", "Avg Age Days", "Max Age Days",
+    ">90d", ">90 Day %", ">90 Day Breaks", ">180d", ">180 Day Breaks", ">365d", ">365 Day Breaks",
+    "Total ABS GBP", "Avg GBP / Break", "Unique Jira Refs",
+    # MoM analytics
+    "MoM Δ", "MoM Δ %",
+    # Jira API enrichment
+    "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
+    # FP Thresholding priority outputs
+    "Priority", "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+    "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+    "Tag for Review",
+    # Derived/renamed aggregates
+    "Top Jira", "Jira Desc",
+})
+_PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
+_ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
+_YELLOW_HEADER = {"backgroundColor": "#FFF176", "color": "#212121", "fontWeight": "bold"}
+
+
+def _is_computed_col(col: str) -> bool:
+    return (col in _COMPUTED_HEADER_COLS
+            or _PERIOD_RE.match(col) is not None
+            or _ABS_CNT_RE.match(col) is not None)
+
+
+def _apply_computed_headers(gb, df_cols) -> None:
+    """Apply yellow headerStyle to every computed/derived column in df_cols."""
+    for col in df_cols:
+        if _is_computed_col(col):
+            gb.configure_column(col, headerStyle=_YELLOW_HEADER)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -587,6 +631,55 @@ def clear_all_cache() -> int:
         except Exception:
             pass
     return deleted
+
+
+def _fetch_one_issue(ref_str: str, conn) -> tuple:
+    """Fetch a single Jira issue; returns (ref_str, metadata_dict)."""
+    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
+    try:
+        issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
+        return ref_str, {
+            "Jira Summary": issue.fields.summary or "—",
+            "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                            if issue.fields.assignee else "—",
+            "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                            if issue.fields.reporter else "—",
+            "Status":       getattr(issue.fields.status, "name", "—")
+                            if issue.fields.status else "—",
+            "Created Date": str(issue.fields.created)[:10]
+                            if issue.fields.created else "—",
+        }
+    except Exception:
+        return ref_str, _NF
+
+
+def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
+                        progress_bar=None) -> dict:
+    """
+    Parallel-fetch Jira metadata for pre-filtered CTRLS- refs only.
+    Caller must pass only refs not already in the store.
+    Returns dict: ref_str → metadata_dict.
+    """
+    if not ctrls_refs:
+        return {}
+    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
+    try:
+        conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
+    except Exception as e:
+        return {r: {**_NF, "Jira Summary": f"Connect error: {e}"} for r in ctrls_refs}
+
+    total, done, result = len(ctrls_refs), 0, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, total)) as pool:
+        futures = {pool.submit(_fetch_one_issue, r, conn): r for r in ctrls_refs}
+        for future in concurrent.futures.as_completed(futures):
+            ref_str, meta = future.result()
+            result[ref_str] = meta
+            done += 1
+            if progress_bar is not None:
+                progress_bar.progress(done / total)
+    return result
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -1348,10 +1441,61 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
              summary_df[prev].replace(0, np.nan)) * 100
         ).round(1)
 
+    # ── Live Jira Enrichment (incremental per-ref cache + parallel fetch) ──────────
+    _jira_enriched_cols = []
+    if selected_label == "Jira Reference" and HAS_JIRA:
+        _jira_url   = st.session_state.get("_jira_url", "")
+        _jira_email = st.session_state.get("_jira_email", "")
+        _jira_token = st.session_state.get("_jira_token", "")
+        if _jira_url and _jira_email and _jira_token:
+            # Clear store when credentials change
+            _cred_hash = hashlib.md5((_jira_url + _jira_email + _jira_token).encode()).hexdigest()[:12]
+            if st.session_state.get("_jira_cred_hash") != _cred_hash:
+                st.session_state["_jira_cred_hash"]  = _cred_hash
+                st.session_state["_jira_meta_store"] = {}
+            _store = st.session_state.setdefault("_jira_meta_store", {})
+
+            _all_refs = sorted(summary_df[selected_label].astype(str).tolist())
+            _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip",
+                     "Status": "Skip", "Created Date": "Skip"}
+
+            # Mark non-CTRLS refs as Skip immediately (no API call ever)
+            for _r in _all_refs:
+                if "CTRLS-" not in _r.upper() and _r not in _store:
+                    _store[_r] = _SKIP
+
+            # Only fetch CTRLS- refs not yet in store
+            _to_fetch = [r for r in _all_refs if "CTRLS-" in r.upper() and r not in _store]
+
+            if _to_fetch:
+                _pbar = st.progress(0.0, text=f"Fetching {len(_to_fetch)} new CTRLS- ref(s)…")
+                _new  = fetch_jira_metadata(_to_fetch, _jira_url, _jira_email, _jira_token,
+                                            progress_bar=_pbar)
+                _store.update(_new)
+                _pbar.empty()
+
+            _jira_meta = {r: _store[r] for r in _all_refs if r in _store}
+            _n_fetched = sum(1 for v in _jira_meta.values()
+                             if v.get("Jira Summary") not in ("Skip", "Not Found", "")
+                             and not str(v.get("Jira Summary", "")).startswith("Connect error"))
+            _n_skip    = sum(1 for v in _jira_meta.values() if v.get("Jira Summary") == "Skip")
+            st.caption(f"🔗 Jira: **{_n_fetched}** CTRLS- fetched · **{_n_skip}** skipped · "
+                       f"**{len(_store)}** in store")
+            _meta_df = (
+                pd.DataFrame.from_dict(_jira_meta, orient="index")
+                .reset_index()
+                .rename(columns={"index": selected_label})
+            )
+            summary_df = summary_df.merge(_meta_df, on=selected_label, how="left")
+            _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Status", "Created Date"]
+        else:
+            st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
+
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
-    for c in ["Jira Description", "System to be Fixed", "Account Group",
-              "Products Reconciled", "Unique Jira Refs"]:
+    for c in ["Jira Description", "System to be Fixed",
+              "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
+              "Account Group", "Products Reconciled", "Unique Jira Refs"]:
         if c in summary_df.columns: col_order.append(c)
     col_order.append("Break Count")
     # All period columns in chronological order
@@ -1383,6 +1527,16 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                                 tooltipField="Jira Description")
         if "System to be Fixed" in summary_df.columns:
             gb.configure_column("System to be Fixed", width=200)
+        if "Jira Summary" in summary_df.columns:
+            gb.configure_column("Jira Summary", width=300, tooltipField="Jira Summary")
+        if "Assignee" in summary_df.columns:
+            gb.configure_column("Assignee", width=150)
+        if "Reporter" in summary_df.columns:
+            gb.configure_column("Reporter", width=150)
+        if "Status" in summary_df.columns:
+            gb.configure_column("Status", width=110)
+        if "Created Date" in summary_df.columns:
+            gb.configure_column("Created Date", width=120)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
@@ -1401,6 +1555,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
+        _apply_computed_headers(gb, summary_df.columns.tolist())
         AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
@@ -2053,10 +2208,11 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         _issue_src = [seg_sel, issue_cat_col]
         if issue_cat2_col and issue_cat2_col in df_f.columns:
             _issue_src.append(issue_cat2_col)
+        _issue_grp_cols = list(dict.fromkeys(_issue_src))  # deduplicate preserving order
         issue_meta = (
-            df_f[_issue_src]
+            df_f[_issue_grp_cols]
             .dropna(subset=[issue_cat_col])
-            .groupby(_issue_src)
+            .groupby(_issue_grp_cols)
             .size().reset_index(name="_cnt")
             .sort_values("_cnt", ascending=False)
             .drop_duplicates(subset=[seg_sel])
@@ -2111,6 +2267,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         if "Issue Category 2" in display_df.columns:
             gb_fp.configure_column("Issue Category 2", width=200)
         gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb_fp, display_df.columns.tolist())
         fp_grid = AgGrid(
             display_df,
             gridOptions=gb_fp.build(),
@@ -2356,6 +2513,32 @@ def main():
             n = clear_all_cache()
             st.success(f"Cleared {n} cached file(s). Upload a new file to begin.")
             st.rerun()
+
+    # ── Jira Integration ──
+    with st.sidebar.expander("🔗 Jira Integration", expanded=False):
+        if not HAS_JIRA:
+            st.warning("Install the `jira` package to enable live Jira enrichment.\n\n`pip install jira`")
+        else:
+            st.caption("Credentials are used only this session and never stored to disk.")
+            _jira_url_inp   = st.text_input(
+                "Jira URL", value=st.session_state.get("_jira_url", ""),
+                placeholder="https://yourcompany.atlassian.net", key="_jira_url_inp")
+            _jira_email_inp = st.text_input(
+                "Email", value=st.session_state.get("_jira_email", ""),
+                key="_jira_email_inp")
+            _jira_token_inp = st.text_input(
+                "Password / API Token", value=st.session_state.get("_jira_token", ""),
+                type="password", key="_jira_token_inp")
+            if st.button("Save Credentials", key="_jira_save"):
+                st.session_state["_jira_url"]   = _jira_url_inp
+                st.session_state["_jira_email"] = _jira_email_inp
+                st.session_state["_jira_token"] = _jira_token_inp
+                # Clear previously fetched metadata so next load re-fetches
+                for _k in [k for k in list(st.session_state.keys()) if k.startswith("_jira_meta_")]:
+                    del st.session_state[_k]
+                st.success("Credentials saved. Metadata will refresh on next tab load.")
+            if st.session_state.get("_jira_url"):
+                st.caption(f"Connected to: {st.session_state['_jira_url']}")
 
     uploaded_latest = st.sidebar.file_uploader(
         "📂 Latest Period File",
