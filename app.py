@@ -2053,10 +2053,11 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         _issue_src = [seg_sel, issue_cat_col]
         if issue_cat2_col and issue_cat2_col in df_f.columns:
             _issue_src.append(issue_cat2_col)
+        _issue_grp_cols = list(dict.fromkeys(_issue_src))  # deduplicate preserving order
         issue_meta = (
-            df_f[_issue_src]
+            df_f[_issue_grp_cols]
             .dropna(subset=[issue_cat_col])
-            .groupby(_issue_src)
+            .groupby(_issue_grp_cols)
             .size().reset_index(name="_cnt")
             .sort_values("_cnt", ascending=False)
             .drop_duplicates(subset=[seg_sel])
