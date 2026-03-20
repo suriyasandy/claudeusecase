@@ -240,7 +240,7 @@ _COMPUTED_HEADER_COLS = frozenset({
 })
 _PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
 _ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
-_YELLOW_HEADER = {"backgroundColor": "#FFF176", "color": "#212121", "fontWeight": "bold"}
+_YELLOW_HEADER_CLASS = "computed-col-header"
 
 
 def _is_computed_col(col: str) -> bool:
@@ -250,10 +250,10 @@ def _is_computed_col(col: str) -> bool:
 
 
 def _apply_computed_headers(gb, df_cols) -> None:
-    """Apply yellow headerStyle to every computed/derived column in df_cols."""
+    """Apply yellow header class to every computed/derived column in df_cols."""
     for col in df_cols:
         if _is_computed_col(col):
-            gb.configure_column(col, headerStyle=_YELLOW_HEADER)
+            gb.configure_column(col, headerClass=_YELLOW_HEADER_CLASS)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -2411,6 +2411,17 @@ def main():
     # Build filters and apply
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
+
+    # Inject CSS for computed-column yellow headers in all AgGrid tables
+    st.markdown("""
+<style>
+.computed-col-header {
+    background-color: #FFF176 !important;
+    color: #212121 !important;
+    font-weight: bold !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
     # Tabs
     tab1, tab2, tab3 = st.tabs([
