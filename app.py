@@ -214,6 +214,7 @@ def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
         _apply_computed_headers(gb, df.columns.tolist())
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
+               custom_css=_AGGRID_CUSTOM_CSS,
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(df, width='stretch', height=height)
@@ -230,8 +231,10 @@ _COMPUTED_HEADER_COLS = frozenset({
     # Jira API enrichment
     "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
     # FP Thresholding priority outputs
-    "Priority", "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
-    "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+    "Priority", "Latest ABS GBP", "Prev Month ABS GBP", "MoM GBP Δ%",
+    "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+    "Latest Break Count", "Prev Month Break Cnt", "MoM Cnt Δ%",
+    "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
     "Tag for Review",
     # Derived/renamed aggregates
     "Top Jira", "Jira Desc",
@@ -240,7 +243,14 @@ _COMPUTED_HEADER_COLS = frozenset({
 })
 _PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
 _ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
-_YELLOW_HEADER_CLASS = "computed-col-header"
+_COMPUTED_HEADER_CLASS = "computed-col-header"
+_AGGRID_CUSTOM_CSS = {
+    ".computed-col-header": {
+        "background-color": "#E3F2FD !important",
+        "color": "#0D47A1 !important",
+        "font-weight": "bold !important",
+    }
+}
 
 
 def _is_computed_col(col: str) -> bool:
@@ -250,10 +260,10 @@ def _is_computed_col(col: str) -> bool:
 
 
 def _apply_computed_headers(gb, df_cols) -> None:
-    """Apply yellow header class to every computed/derived column in df_cols."""
+    """Apply blue header class to every computed/derived column in df_cols."""
     for col in df_cols:
         if _is_computed_col(col):
-            gb.configure_column(col, headerClass=_YELLOW_HEADER_CLASS)
+            gb.configure_column(col, headerClass=_COMPUTED_HEADER_CLASS)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -1338,6 +1348,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
         AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
+               custom_css=_AGGRID_CUSTOM_CSS,
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(summary_df, height=500, width='stretch')
@@ -1850,6 +1861,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         return
 
     latest_period = period_order[-1]
+    prev_period   = period_order[-2]   # previous month (for MoM)
     hist_periods  = period_order[:-1]
 
     # ── Controls ──────────────────────────────────────────────────────────────
@@ -1896,6 +1908,12 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     pivot["Latest ABS GBP"]   = np.round(latest_data, 0)
     pivot["vs Hist Avg %"]    = np.round(dev_pct, 1)
 
+    # MoM comparison: latest vs previous month
+    prev_gbp    = pivot[prev_period].values.astype(float)
+    mom_gbp_pct = (latest_data - prev_gbp) / np.maximum(prev_gbp, 1) * 100
+    pivot["Prev Month ABS GBP"] = np.round(prev_gbp, 0)
+    pivot["MoM GBP Δ%"]        = np.round(mom_gbp_pct, 1)
+
     # ABS GBP trend direction (slope of linear fit across historical periods)
     if len(hist_periods) >= 2:
         x = np.arange(len(hist_periods), dtype=float)
@@ -1931,6 +1949,12 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     pivot["Hist Avg Break Count"] = np.round(hist_cnt_mean, 1)
     pivot["vs Hist Count %"]      = np.round(dev_pct_cnt, 1)
 
+    # MoM comparison for break count: latest vs previous month
+    prev_cnt_data = pivot[f"_cnt_{prev_period}"].values.astype(float)
+    mom_cnt_pct   = (latest_cnt_data - prev_cnt_data) / np.maximum(prev_cnt_data, 1) * 100
+    pivot["Prev Month Break Cnt"] = prev_cnt_data.astype(int)
+    pivot["MoM Cnt Δ%"]          = np.round(mom_cnt_pct, 1)
+
     # Break count trend direction
     if len(hist_periods) >= 2:
         cnt_slopes = np.array([
@@ -1942,9 +1966,9 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     else:
         pivot["Count Trend"] = "—"
 
-    # ── Composite priority score: weighted blend of ABS GBP + Break Count ────
+    # ── Composite priority score: weighted blend of MoM GBP% + MoM Count% (vs previous month) ────
     w_cnt           = cnt_weight / 100.0
-    composite_score = (1.0 - w_cnt) * dev_pct + w_cnt * dev_pct_cnt
+    composite_score = (1.0 - w_cnt) * mom_gbp_pct + w_cnt * mom_cnt_pct
 
     conditions = [
         composite_score >= high_thresh,
@@ -2028,8 +2052,10 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     display_cols = (
         [seg_sel] + _jira_display_cols + _issue_display_cols +
         ["Priority",
-         "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
-         "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+         "Latest ABS GBP", "Prev Month ABS GBP", "MoM GBP Δ%",
+         "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+         "Latest Break Count", "Prev Month Break Cnt", "MoM Cnt Δ%",
+         "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
          "Tag for Review"] +
         [f"ABS {p}" for p in period_order] +
         [f"Cnt {p}" for p in period_order]
@@ -2066,6 +2092,41 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
             gb_fp.configure_column("Issue Category 2", width=200)
         gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
         _apply_computed_headers(gb_fp, display_df.columns.tolist())
+        # Priority colour
+        _pri_cs = JsCode("""function(p){
+            var v=(p.value||'');
+            if(v.indexOf('High')>=0)   return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+            if(v.indexOf('Medium')>=0) return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+            if(v.indexOf('Low')>=0)    return {'backgroundColor':'#E8F5E9','color':'#1B5E20'};
+            return {};}""")
+        gb_fp.configure_column("Priority", cellStyle=_pri_cs, width=160)
+        # MoM % columns: red if positive (worse), green if negative (better)
+        _mom_cs = JsCode("""function(p){
+            var v=parseFloat(p.value);
+            if(v > 0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+            if(v < 0) return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+            return {};}""")
+        for _mc in ["MoM GBP Δ%", "MoM Cnt Δ%"]:
+            if _mc in display_df.columns:
+                gb_fp.configure_column(_mc, cellStyle=_mom_cs, width=115)
+        # vs Hist Avg %: orange/red for elevated segments
+        _hist_cs = JsCode("""function(p){
+            var v=parseFloat(p.value);
+            if(v>=50) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+            if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
+            return {};}""")
+        for _hc in ["vs Hist Avg %", "vs Hist Count %"]:
+            if _hc in display_df.columns:
+                gb_fp.configure_column(_hc, cellStyle=_hist_cs, width=120)
+        # Trend arrows
+        _trend_cs = JsCode("""function(p){
+            var v=(p.value||'');
+            if(v.indexOf('Rising')>=0)  return {'color':'#A84B2F','fontWeight':'bold'};
+            if(v.indexOf('Falling')>=0) return {'color':'#01696F','fontWeight':'bold'};
+            return {};}""")
+        for _tc in ["Trend", "Count Trend"]:
+            if _tc in display_df.columns:
+                gb_fp.configure_column(_tc, cellStyle=_trend_cs, width=110)
         fp_grid = AgGrid(
             display_df,
             gridOptions=gb_fp.build(),
@@ -2073,6 +2134,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
             theme="streamlit",
             allow_unsafe_jscode=True,
             key="_fp_priority_grid",
+            custom_css=_AGGRID_CUSTOM_CSS,
             update_mode=GridUpdateMode.VALUE_CHANGED,
         )
         edited = pd.DataFrame(fp_grid["data"]) if fp_grid["data"] is not None else display_df
@@ -2105,32 +2167,79 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         else:
             st.info("No segments tagged.")
 
-    # ── ABS GBP Trend chart for top-10 segments ────────────────────────────────
-    top10_segs = result_df.nlargest(10, "Latest ABS GBP")[seg_sel].tolist()
-    trend_rows = grp[grp[seg_sel].isin(top10_segs)].copy()
-    trend_rows[abs_col] = trend_rows[abs_col].round(0)
-    if len(trend_rows) > 0:
-        fig_t = px.line(
-            trend_rows.sort_values("_Period_label"),
-            x="_Period_label", y=abs_col, color=seg_sel,
-            color_discrete_sequence=COLORS, markers=True,
-        )
-        fig_t = chart_layout(fig_t, f"ABS GBP Trend — Top 10 by {seg_sel}",
-                             "Period", "ABS GBP (£)", height=420)
-        st.plotly_chart(fig_t, width='stretch')
+    # ── Charts ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    _pc1, _pc2 = st.columns(2)
 
-    # ── Break Count Trend chart for top-10 segments by count ──────────────────
-    top10_by_cnt = result_df.nlargest(10, "Latest Break Count")[seg_sel].tolist()
-    cnt_trend_rows = grp_cnt[grp_cnt[seg_sel].isin(top10_by_cnt)].copy()
-    if len(cnt_trend_rows) > 0:
-        fig_c = px.line(
-            cnt_trend_rows.sort_values("_Period_label"),
-            x="_Period_label", y="_cnt", color=seg_sel,
-            color_discrete_sequence=COLORS, markers=True,
+    # Left: Priority distribution
+    with _pc1:
+        _pri_counts = (
+            result_df["Priority"].value_counts()
+            .reindex(["🔴 High", "🟡 Medium", "🟢 Low / FP Candidate"], fill_value=0)
+            .reset_index()
         )
-        fig_c = chart_layout(fig_c, f"Break Count Trend — Top 10 by {seg_sel}",
-                             "Period", "Break Count", height=420)
-        st.plotly_chart(fig_c, width='stretch')
+        _pri_counts.columns = ["Priority", "Count"]
+        _fig_pri = px.bar(
+            _pri_counts, x="Count", y="Priority", orientation="h",
+            color="Priority",
+            color_discrete_map={
+                "🔴 High": "#EF5350",
+                "🟡 Medium": "#FFA726",
+                "🟢 Low / FP Candidate": "#66BB6A",
+            },
+            text="Count",
+        )
+        _fig_pri = chart_layout(_fig_pri, "Priority Distribution", "Count", "Priority", height=300)
+        _fig_pri.update_traces(textposition="outside")
+        _fig_pri.update_layout(showlegend=False)
+        st.plotly_chart(_fig_pri, width='stretch')
+
+    # Right: Top 10 segments by MoM GBP Δ%
+    with _pc2:
+        if "MoM GBP Δ%" in result_df.columns:
+            _mom_top = result_df.nlargest(10, "MoM GBP Δ%")[[seg_sel, "MoM GBP Δ%"]].copy()
+            _fig_mom = px.bar(
+                _mom_top.sort_values("MoM GBP Δ%"),
+                x="MoM GBP Δ%", y=seg_sel, orientation="h",
+                color="MoM GBP Δ%",
+                color_continuous_scale=["#66BB6A", "#FFA726", "#EF5350"],
+                text="MoM GBP Δ%",
+            )
+            _fig_mom = chart_layout(
+                _fig_mom,
+                f"Top 10 MoM GBP Change (%) — {seg_sel}",
+                "MoM Δ%", seg_sel, height=300,
+            )
+            _fig_mom.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            _fig_mom.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(_fig_mom, width='stretch')
+
+    # Bottom: Latest vs Previous Month ABS GBP grouped bar for top 10 segments
+    if "Prev Month ABS GBP" in result_df.columns:
+        _top10 = result_df.nlargest(10, "Latest ABS GBP")[
+            [seg_sel, "Latest ABS GBP", "Prev Month ABS GBP"]
+        ].copy()
+        _bar_df = pd.melt(
+            _top10, id_vars=[seg_sel],
+            value_vars=["Latest ABS GBP", "Prev Month ABS GBP"],
+            var_name="Period Type", value_name="ABS GBP",
+        )
+        _fig_cmp = px.bar(
+            _bar_df, x=seg_sel, y="ABS GBP", color="Period Type",
+            barmode="group",
+            color_discrete_map={
+                "Latest ABS GBP":     "#1565C0",
+                "Prev Month ABS GBP": "#90CAF9",
+            },
+            text="ABS GBP",
+        )
+        _fig_cmp = chart_layout(
+            _fig_cmp,
+            f"Latest vs Previous Month ABS GBP — Top 10 by {seg_sel}",
+            seg_sel, "ABS GBP (£)", height=420,
+        )
+        _fig_cmp.update_traces(texttemplate="£%{text:,.0f}", textposition="outside")
+        st.plotly_chart(_fig_cmp, width='stretch')
 
     # Download
     st.download_button(
@@ -2411,17 +2520,6 @@ def main():
     # Build filters and apply
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
-
-    # Inject CSS for computed-column yellow headers in all AgGrid tables
-    st.markdown("""
-<style>
-.computed-col-header {
-    background-color: #FFF176 !important;
-    color: #212121 !important;
-    font-weight: bold !important;
-}
-</style>
-""", unsafe_allow_html=True)
 
     # Tabs
     tab1, tab2, tab3 = st.tabs([
