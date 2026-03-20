@@ -44,6 +44,7 @@ import math
 import os
 import re
 import tempfile
+import time
 from datetime import date as _date
 from io import BytesIO
 
@@ -234,6 +235,8 @@ _COMPUTED_HEADER_COLS = frozenset({
     "Tag for Review",
     # Derived/renamed aggregates
     "Top Jira", "Jira Desc",
+    # Ageing detail table renames
+    "Age Days", "Ageing Bucket", "Period",
 })
 _PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
 _ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
@@ -633,46 +636,51 @@ def clear_all_cache() -> int:
     return deleted
 
 
-def _fetch_one_issue(ref_str: str, conn) -> tuple:
-    """Fetch a single Jira issue; returns (ref_str, metadata_dict)."""
+def _fetch_one_issue(ref_str: str, url: str, email: str, token: str) -> tuple:
+    """Fetch one Jira issue; per-thread connection (thread-safe). Retries on 429."""
+    ref_str = ref_str.strip()
     _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
            "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
-    try:
-        issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
-        return ref_str, {
-            "Jira Summary": issue.fields.summary or "—",
-            "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
-                            if issue.fields.assignee else "—",
-            "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
-                            if issue.fields.reporter else "—",
-            "Status":       getattr(issue.fields.status, "name", "—")
-                            if issue.fields.status else "—",
-            "Created Date": str(issue.fields.created)[:10]
-                            if issue.fields.created else "—",
-        }
-    except Exception:
-        return ref_str, _NF
+    _delays = [2, 4, 8]
+    for attempt, _delay in enumerate([0] + _delays):
+        if _delay:
+            time.sleep(_delay)
+        try:
+            conn  = _JiraClient(options={"server": url}, basic_auth=(email, token))
+            issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
+            return ref_str, {
+                "Jira Summary": issue.fields.summary or "—",
+                "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                                if issue.fields.assignee else "—",
+                "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                                if issue.fields.reporter else "—",
+                "Status":       getattr(issue.fields.status, "name", "—")
+                                if issue.fields.status else "—",
+                "Created Date": str(issue.fields.created)[:10]
+                                if issue.fields.created else "—",
+            }
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate" in err.lower():
+                if attempt < len(_delays):
+                    continue          # retry after sleep
+                return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
+            return ref_str, {**_NF, "Jira Summary": f"Error: {type(e).__name__}: {err[:120]}"}
+    return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
 
 
 def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
                         progress_bar=None) -> dict:
     """
     Parallel-fetch Jira metadata for pre-filtered CTRLS- refs only.
-    Caller must pass only refs not already in the store.
-    Returns dict: ref_str → metadata_dict.
+    Each worker creates its own Jira connection (thread-safe; no shared session).
     """
     if not ctrls_refs:
         return {}
-    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
-           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
-    try:
-        conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
-    except Exception as e:
-        return {r: {**_NF, "Jira Summary": f"Connect error: {e}"} for r in ctrls_refs}
-
     total, done, result = len(ctrls_refs), 0, {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, total)) as pool:
-        futures = {pool.submit(_fetch_one_issue, r, conn): r for r in ctrls_refs}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, total)) as pool:
+        futures = {pool.submit(_fetch_one_issue, r, url, email, token): r
+                   for r in ctrls_refs}
         for future in concurrent.futures.as_completed(futures):
             ref_str, meta = future.result()
             result[ref_str] = meta
@@ -757,7 +765,19 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
         pct = n_null / max(len(df_f), 1) * 100
         null_rows.append({"Column": col, "Null Count": n_null, "Null %": round(pct, 1)})
     null_df = pd.DataFrame(null_rows).sort_values("Null %", ascending=False)
-    st.dataframe(null_df, width='stretch', hide_index=True)
+    try:
+        st.dataframe(
+            null_df,
+            column_config={
+                "Null %": st.column_config.ProgressColumn(
+                    "Null %", format="%.1f%%", min_value=0, max_value=100,
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+    except Exception:
+        st.dataframe(null_df, width='stretch', hide_index=True)
 
     overflow_count = st.session_state.get("_overflow", 0)
     if overflow_count and overflow_count > 0:
@@ -765,6 +785,14 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
             f'<div class="banner-warn">⚠️ {overflow_count} amount value(s) exceed JavaScript safe integer '
             f'({MAX_JS_INT:,}) and may display imprecisely in charts.</div>',
             unsafe_allow_html=True)
+
+
+def tab_quality_and_ageing(
+    df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict, hist_df=None
+) -> None:
+    tab_data_quality(df, df_f, col_map)
+    st.markdown("---")
+    tab_ageing_validation(df_f, col_map, hist_df)
 
 
 # ── Tab: Ageing Validation ────────────────────────────────────────────────────
@@ -916,314 +944,49 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
         fig3 = chart_layout(fig3, "Average Age Days Trend by Period", "Period", "Avg Age Days", height=340)
         st.plotly_chart(fig3, width='stretch')
 
-
-# ── Tab: Break Counts + Drill-Down ────────────────────────────────────────────
-
-def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 📈 Break Counts + Drill-Down")
-
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
-
-    if "_Period_label" not in df_f.columns:
-        st.info("No period data available.")
-        return
-
-    # Top-10 Rec Names trend
-    if rec_actual and rec_actual in df_f.columns:
-        # Combine hist + current so trend spans all available periods
-        _trend_cols = [rec_actual, "_Period_label"]
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and rec_actual in hist_df.columns):
-            _trend_src = pd.concat(
-                [hist_df[_trend_cols], df_f[_trend_cols]], ignore_index=True
-            )
-        else:
-            _trend_src = df_f[_trend_cols]
-        top10_series = _trend_src[rec_actual].value_counts().head(10).index.tolist()
-        top10_df = _trend_src[_trend_src[rec_actual].isin(top10_series)]
-        trend = (
-            top10_df.groupby(["_Period_label", rec_actual])
-            .size()
-            .reset_index(name="Count")
-            .sort_values("_Period_label")
-        )
-        fig = px.line(
-            trend, x="_Period_label", y="Count", color=rec_actual,
-            color_discrete_sequence=COLORS, markers=True,
-        )
-        fig = chart_layout(fig, "Top-10 Rec Names — Break Count Trend", "Period", "Count", height=420)
-        st.plotly_chart(fig, width='stretch')
-
-        st.markdown("---")
-        # ── Drill-Down Section ────────────────────────────────────────────────
-        st.markdown("### 🔍 Drill-Down by Rec Name")
-        all_recs = sorted(df_f[rec_actual].dropna().astype(str).unique().tolist())
-
-        # Validate session state before rendering selectbox (Change 10)
-        if st.session_state.get("_drill_rec") not in all_recs:
-            st.session_state["_drill_rec"] = top10_series[0] if top10_series else (all_recs[0] if all_recs else None)
-
-        if all_recs:
-            selected_rec = st.selectbox(
-                "Select Rec Name to drill into:",
-                all_recs,
-                index=all_recs.index(st.session_state["_drill_rec"]) if st.session_state.get("_drill_rec") in all_recs else 0,
-                key="_drill_rec",
-            )
-
-            st.markdown(
-                f'<div class="banner-drill">🔬 Drilling into: <b>{selected_rec}</b></div>',
-                unsafe_allow_html=True)
-
-            rec_df = df_f[df_f[rec_actual].astype(str) == selected_rec].copy()
-
-            # Build combined source (hist + current) for trend charts
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns
-                    and rec_actual in hist_df.columns):
-                rec_hist_df = hist_df[hist_df[rec_actual].astype(str) == selected_rec].copy()
-                rec_combined_df = pd.concat([rec_hist_df, rec_df], ignore_index=True)
-            else:
-                rec_combined_df = rec_df
-
-            if len(rec_df) == 0:
-                st.warning("No data for selected Rec Name.")
-            else:
-                st.markdown(f"**{format_number(len(rec_df))} breaks** in this Rec")
-
-                with st.container():
-                    st.markdown('<div class="drill-section">', unsafe_allow_html=True)
-
-                    # ── Toggle controls ───────────────────────────────────────
-                    entity_actual = col_map.get("Entity")
-                    type_actual   = col_map.get("Type of Break")
-                    ac_actual     = col_map.get("Asset Class")
-                    abs_actual    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
-
-                    # Build available breakdown dims (only those present in data)
-                    _dim_opts = []
-                    if team_actual   and team_actual   in rec_df.columns: _dim_opts.append("Team")
-                    if entity_actual and entity_actual in rec_df.columns: _dim_opts.append("Entity")
-                    if type_actual   and type_actual   in rec_df.columns: _dim_opts.append("Type of Break")
-                    if ac_actual     and ac_actual     in rec_df.columns: _dim_opts.append("Asset Class")
-
-                    _has_amount = bool(abs_actual and abs_actual in rec_df.columns)
-                    _metric_opts = ["Count", "Amount"] if _has_amount else ["Count"]
-
-                    tc1, tc2 = st.columns([2, 3])
-                    with tc1:
-                        _drill_metric = st.radio(
-                            "Metric", _metric_opts, horizontal=True,
-                            key="_drill_metric",
-                        )
-                    with tc2:
-                        if _dim_opts:
-                            _drill_dim = st.selectbox(
-                                "Breakdown by", _dim_opts, key="_drill_dim",
-                            )
-                        else:
-                            _drill_dim = None
-
-                    # ── Single chart based on toggle selection ─────────────────
-                    if _drill_metric == "Count" and _drill_dim:
-                        _dim_col = {
-                            "Team":          team_actual,
-                            "Entity":        entity_actual,
-                            "Type of Break": type_actual,
-                            "Asset Class":   ac_actual,
-                        }[_drill_dim]
-                        period_cnt = dq_local(
-                            f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                            f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(
-                            period_cnt, x="_Period_label", y="cnt", color=_dim_col,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_d = chart_layout(
-                            fig_d,
-                            f"Breaks by Period × {_drill_dim} — {selected_rec}",
-                            "Period", "Count", height=380,
-                        )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Count" and not _drill_dim:
-                        # Fallback: plain period trend
-                        period_cnt = dq_local(
-                            'SELECT "_Period_label", COUNT(*) AS cnt '
-                            'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
-                                       color_discrete_sequence=[PRIMARY])
-                        fig_d = chart_layout(fig_d, f"Breaks by Period — {selected_rec}",
-                                             "Period", "Count", height=360)
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Amount":
-                        if _drill_dim and _drill_dim in ("Team", "Entity"):
-                            _dim_col = team_actual if _drill_dim == "Team" else entity_actual
-                            period_amt_stk = dq_local(
-                                f'SELECT "_Period_label", "{_dim_col}", '
-                                f'SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                                f'ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(
-                                period_amt_stk, x="_Period_label", y="total_amt",
-                                color=_dim_col, color_discrete_sequence=COLORS, barmode="stack",
-                            )
-                            fig_d = chart_layout(
-                                fig_d,
-                                f"ABS GBP by Period × {_drill_dim} — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=380,
-                            )
-                        else:
-                            # Amount by period only (no useful stack for Type/Asset Class)
-                            period_amt = dq_local(
-                                f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
-                                           color_discrete_sequence=[PRIMARY])
-                            fig_d.update_traces(
-                                text=[format_short(v) for v in period_amt["total_amt"]],
-                                textposition="outside",
-                            )
-                            fig_d = chart_layout(
-                                fig_d, f"ABS GBP by Period — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=360,
-                            )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        # No rec column — show overall period trend using hist+current data
-        if "_Period_label" in df_f.columns:
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns):
-                _all_src = pd.concat(
-                    [hist_df[["_Period_label"]], df_f[["_Period_label"]]], ignore_index=True
-                )
-            else:
-                _all_src = df_f[["_Period_label"]]
-            period_cnt = _all_src.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
-            fig = px.bar(period_cnt, x="_Period_label", y="Count", color_discrete_sequence=[PRIMARY])
-            fig = chart_layout(fig, "Break Count by Period", "Period", "Count", height=380)
-            st.plotly_chart(fig, width='stretch')
-
-
-# ── Tab: Amount Analysis ──────────────────────────────────────────────────────
-
-def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 💷 Amount Analysis")
-
-    abs_actual = col_map.get("ABS GBP")
-    brk_actual = col_map.get("BREAK AMOUNT GBP")
-    amt_col = abs_actual or brk_actual
-
-    if not amt_col or amt_col not in df_f.columns:
-        st.info("No amount column found. Ensure 'ABS GBP' or 'BREAK AMOUNT GBP' is present.")
-        return
-
-    total_amt = df_f[amt_col].abs().sum()
-    avg_amt   = df_f[amt_col].abs().mean()
-    max_amt   = df_f[amt_col].abs().max()
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        kpi_card("Total ABS Amount (£)", format_short(total_amt))
-    with k2:
-        kpi_card("Avg ABS Amount (£)", format_short(avg_amt))
-    with k3:
-        kpi_card("Max ABS Amount (£)", format_short(max_amt))
-    with k4:
-        kpi_card("Total Breaks", format_number(len(df_f)))
-
+    # ── Ageing Detail: breaks > 90 days ──────────────────────────────────────
     st.markdown("---")
+    st.markdown("### 🔍 Breaks Exceeding 90-Day Threshold")
 
-    # ── Chart view toggle ─────────────────────────────────────────────────────
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
+    if "_Computed_Age_Days" in df_f.columns:
+        _age_cols = []
+        for _lbl, _key in [
+            ("Jira Reference",     "Jira Reference"),
+            ("Rec Name",           "Rec Name (as per Rec Cube)"),
+            ("System to be Fixed", "System to be Fixed"),
+            ("Team",               "Team"),
+            ("Issue Category",     "Issue Category"),
+        ]:
+            _c = col_map.get(_key)
+            if _c and _c in df_f.columns:
+                _age_cols.append(_c)
+        if "_Period_label" in df_f.columns:
+            _age_cols.append("_Period_label")
+        _age_cols += ["_Computed_Age_Days", "_Computed_Bucket"]
+        _abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+        if _abs_col and _abs_col in df_f.columns:
+            _age_cols.append(_abs_col)
 
-    _view_opts = ["By Period"]
-    if rec_actual  and rec_actual  in df_f.columns: _view_opts.append("By Rec Name")
-    if team_actual and team_actual in df_f.columns: _view_opts.append("By Team")
-    _view_opts.append("Distribution")
-
-    _amt_view = st.radio("View", _view_opts, horizontal=True, key="_amt_view")
-
-    if _amt_view == "By Period" and "_Period_label" in df_f.columns:
-        # Merge historical periods so the chart shows full trend
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and amt_col in hist_df.columns):
-            _period_src = pd.concat(
-                [hist_df[["_Period_label", amt_col]],
-                 df_f[["_Period_label", amt_col]]], ignore_index=True
-            )
-        else:
-            _period_src = df_f[["_Period_label", amt_col]]
-        period_amt = dq_local(
-            f'SELECT "_Period_label", SUM({safe_amt(amt_col)}) AS total_amt '
-            f'FROM tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-            tbl=_period_src
+        _age_df = (
+            df_f[[c for c in _age_cols if c in df_f.columns]]
+            .rename(columns={
+                "_Period_label":      "Period",
+                "_Computed_Age_Days": "Age Days",
+                "_Computed_Bucket":   "Ageing Bucket",
+            })
         )
-        fig = px.bar(
-            period_amt, x="_Period_label", y="total_amt",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in period_amt["total_amt"]],
-        )
-        fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
-        st.plotly_chart(fig, width='stretch')
+        _age_df = _age_df[_age_df["Age Days"] > 90].sort_values("Age Days", ascending=False)
 
-    elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
-        rec_amt = (
-            df_f.groupby(rec_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
+        st.caption(f"**{len(_age_df):,}** break record(s) with Age Days > 90")
+        render_grid(_age_df, height=420, key="ageing_detail_grid")
+        st.download_button(
+            "📥 Download Ageing Detail (CSV)",
+            _age_df.to_csv(index=False).encode("utf-8"),
+            file_name="ageing_breaks_over_90d.csv",
+            mime="text/csv",
         )
-        rec_amt.columns = [rec_actual, "Total ABS (£)"]
-        fig2 = px.bar(
-            rec_amt, x=rec_actual, y="Total ABS (£)",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in rec_amt["Total ABS (£)"]],
-        )
-        fig2.update_traces(textposition="outside")
-        fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=420)
-        st.plotly_chart(fig2, width='stretch')
-
-    elif _amt_view == "By Team" and team_actual and team_actual in df_f.columns:
-        team_amt = (
-            df_f.groupby(team_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .reset_index()
-        )
-        team_amt.columns = [team_actual, "Total ABS (£)"]
-        fig3 = px.bar(
-            team_amt, x=team_actual, y="Total ABS (£)",
-            color_discrete_sequence=COLORS[:len(team_amt)],
-            text=[format_short(v) for v in team_amt["Total ABS (£)"]],
-        )
-        fig3.update_traces(textposition="outside")
-        fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=400)
-        st.plotly_chart(fig3, width='stretch')
-
-    else:  # Distribution
-        amt_data = df_f[amt_col].dropna()
-        fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
-        fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=400)
-        st.plotly_chart(fig4, width='stretch')
+    else:
+        st.info("Age data unavailable — ensure 'Age Days' or 'Date' column is mapped.")
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
@@ -1455,7 +1218,8 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 st.session_state["_jira_meta_store"] = {}
             _store = st.session_state.setdefault("_jira_meta_store", {})
 
-            _all_refs = sorted(summary_df[selected_label].astype(str).tolist())
+            _all_refs = sorted({str(r).strip() for r in summary_df[selected_label].tolist()
+                                if str(r).strip() not in ("", "nan", "None")})
             _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip",
                      "Status": "Skip", "Created Date": "Skip"}
 
@@ -1490,6 +1254,10 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Status", "Created Date"]
         else:
             st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
+
+    if len(period_order) < 2:
+        st.info("💡 **MoM Δ unavailable** — upload a historical file (sidebar) or ensure "
+                "the dataset spans 2+ periods to enable month-over-month comparison.")
 
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
@@ -1533,13 +1301,26 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             gb.configure_column("Assignee", width=150)
         if "Reporter" in summary_df.columns:
             gb.configure_column("Reporter", width=150)
-        if "Status" in summary_df.columns:
-            gb.configure_column("Status", width=110)
         if "Created Date" in summary_df.columns:
             gb.configure_column("Created Date", width=120)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
+        # Apply yellow header styling first; cell-level styling below takes final precedence
+        _apply_computed_headers(gb, summary_df.columns.tolist())
+        if "Status" in summary_df.columns:
+            status_cs = JsCode("""function(p){
+                var v=(p.value||'').toLowerCase().trim();
+                if(v==='done')
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                if(v==='to do'||v==='todo')
+                    return {'backgroundColor':'#F5F5F5','color':'#424242','fontWeight':'bold'};
+                if(v==='backlog')
+                    return {'backgroundColor':'#FFEBEE','color':'#B71C1C','fontWeight':'bold'};
+                if(['in analysis','in development','in testing'].indexOf(v)>=0)
+                    return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
+                return {};}""")
+            gb.configure_column("Status", cellStyle=status_cs, width=110)
         if "MoM Δ" in summary_df.columns:
             mom_cs = JsCode("""function(p){
                 var v=p.value;
@@ -1555,7 +1336,6 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
-        _apply_computed_headers(gb, summary_df.columns.tolist())
         AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
@@ -1567,6 +1347,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         f"📥 Download {selected_label} Factor Summary (CSV)",
         summary_df.to_csv(index=False).encode("utf-8"),
         file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
+        mime="text/csv",
+    )
+    # Raw underlying rows for current filtered upload (no internal _ columns)
+    _raw_dl = df.rename(columns={"_Period_label": "Period"})
+    _raw_dl = _raw_dl[[c for c in _raw_dl.columns if not c.startswith("_")]]
+    st.download_button(
+        "📥 Download Raw Breaks — Latest File (CSV)",
+        _raw_dl.to_csv(index=False).encode("utf-8"),
+        file_name="raw_breaks_latest.csv",
         mime="text/csv",
     )
 
@@ -1618,6 +1407,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _drill_src = _summary_src[
                 _summary_src[dim_col].astype(str) == _sel_val
             ].copy()
+
+            _drill_dl = _drill_src.rename(columns={"_Period_label": "Period"})
+            _drill_dl = _drill_dl[[c for c in _drill_dl.columns if not c.startswith("_")]]
+            st.download_button(
+                f"📥 Download Breaks for {_sel_val} (CSV)",
+                _drill_dl.to_csv(index=False).encode("utf-8"),
+                file_name=f"breaks_{str(_sel_val).replace('/', '_')[:40]}.csv",
+                mime="text/csv",
+            )
 
             if len(_drill_src) == 0:
                 st.info(f"No data found for {selected_label} = {_sel_val}.")
@@ -2533,10 +2331,20 @@ def main():
                 st.session_state["_jira_url"]   = _jira_url_inp
                 st.session_state["_jira_email"] = _jira_email_inp
                 st.session_state["_jira_token"] = _jira_token_inp
-                # Clear previously fetched metadata so next load re-fetches
-                for _k in [k for k in list(st.session_state.keys()) if k.startswith("_jira_meta_")]:
+                # Clear all Jira metadata so next tab load re-fetches with new creds
+                for _k in [k for k in list(st.session_state.keys())
+                           if k.startswith("_jira_meta_") or k == "_jira_cred_hash"]:
                     del st.session_state[_k]
                 st.success("Credentials saved. Metadata will refresh on next tab load.")
+            if st.button("🗑️ Clear Jira Metadata", key="_jira_clear_meta",
+                         help="Remove all cached Jira API results so they are re-fetched"):
+                _cleared = 0
+                for _k in [k for k in list(st.session_state.keys())
+                           if k in ("_jira_meta_store", "_jira_cred_hash")
+                           or k.startswith("_jira_meta_")]:
+                    del st.session_state[_k]
+                    _cleared += 1
+                st.success(f"Jira metadata cache cleared ({_cleared} key(s) removed).")
             if st.session_state.get("_jira_url"):
                 st.caption(f"Connected to: {st.session_state['_jira_url']}")
 
@@ -2604,27 +2412,18 @@ def main():
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
 
-    # Tabs — Period Comparison removed; historical data surfaced inside each tab
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🧹 Data Quality",
-        "📅 Ageing Validation",
-        "📈 Break Counts + Drill-Down",
-        "💷 Amount Analysis",
+    # Tabs
+    tab1, tab2, tab3 = st.tabs([
+        "🧹 Data Quality & Ageing",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
     ])
 
     with tab1:
-        tab_data_quality(df, df_f, col_map)
+        tab_quality_and_ageing(df, df_f, col_map, hist_df)
     with tab2:
-        tab_ageing_validation(df_f, col_map, hist_df)
-    with tab3:
-        tab_break_counts(df_f, col_map, hist_df)
-    with tab4:
-        tab_amount_analysis(df_f, col_map, hist_df)
-    with tab5:
         tab_jira_factor_analysis(df_f, col_map, hist_df)
-    with tab6:
+    with tab3:
         tab_fp_thresholding(df_f, col_map, hist_df)
 
 
