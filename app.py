@@ -59,7 +59,7 @@ except ImportError:
     HAS_AGGRID = False
 
 try:
-    from jira import JIRA as _JiraClient
+    from jira import Jira as _JiraClient
     HAS_JIRA = True
 except ImportError:
     HAS_JIRA = False
@@ -606,7 +606,7 @@ def fetch_jira_metadata(jira_refs: list, url: str, email: str, token: str) -> di
                   "Reporter": "Not Found", "Epic": "Not Found"}
     result = {}
     try:
-        conn = _JiraClient(server=url, basic_auth=(email, token), max_retries=1)
+        conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
     except Exception as e:
         return {str(r): {**_NOT_FOUND, "Jira Summary": f"Connect error: {e}"} for r in jira_refs}
 
@@ -2459,7 +2459,7 @@ def main():
                 "Email", value=st.session_state.get("_jira_email", ""),
                 key="_jira_email_inp")
             _jira_token_inp = st.text_input(
-                "API Token", value=st.session_state.get("_jira_token", ""),
+                "Password / API Token", value=st.session_state.get("_jira_token", ""),
                 type="password", key="_jira_token_inp")
             if st.button("Save Credentials", key="_jira_save"):
                 st.session_state["_jira_url"]   = _jira_url_inp
