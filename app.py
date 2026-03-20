@@ -650,8 +650,8 @@ def _fetch_one_issue(ref_str: str, conn) -> tuple:
             "Created Date": str(issue.fields.created)[:10]
                             if issue.fields.created else "—",
         }
-    except Exception:
-        return ref_str, _NF
+    except Exception as e:
+        return ref_str, {**_NF, "Jira Summary": f"Error: {type(e).__name__}: {str(e)[:120]}"}
 
 
 def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
@@ -717,6 +717,26 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 
 # ── Tab: Data Quality ─────────────────────────────────────────────────────────
 
+def _render_break_summary_kpi_row(df_f: pd.DataFrame, col_map: dict) -> None:
+    """Combined headline KPIs for the merged Breaks & Amount tab."""
+    abs_actual = col_map.get("ABS GBP")
+    brk_actual = col_map.get("BREAK AMOUNT GBP")
+    amt_col = abs_actual or brk_actual
+    if not amt_col or amt_col not in df_f.columns:
+        return
+    total_breaks = len(df_f)
+    total_amt    = df_f[amt_col].abs().sum()
+    avg_per_brk  = total_amt / max(total_breaks, 1)
+    k1, k2, k3  = st.columns(3)
+    with k1:
+        kpi_card("Total Breaks", format_number(total_breaks))
+    with k2:
+        kpi_card("Total ABS Exposure (£)", format_short(total_amt))
+    with k3:
+        kpi_card("Avg ABS per Break (£)", format_short(avg_per_brk),
+                 "Financial weight per break")
+
+
 def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> None:
     st.markdown("## 🧹 Data Quality Report")
 
@@ -757,7 +777,19 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
         pct = n_null / max(len(df_f), 1) * 100
         null_rows.append({"Column": col, "Null Count": n_null, "Null %": round(pct, 1)})
     null_df = pd.DataFrame(null_rows).sort_values("Null %", ascending=False)
-    st.dataframe(null_df, width='stretch', hide_index=True)
+    try:
+        st.dataframe(
+            null_df,
+            column_config={
+                "Null %": st.column_config.ProgressColumn(
+                    "Null %", format="%.1f%%", min_value=0, max_value=100,
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+    except Exception:
+        st.dataframe(null_df, width='stretch', hide_index=True)
 
     overflow_count = st.session_state.get("_overflow", 0)
     if overflow_count and overflow_count > 0:
@@ -765,6 +797,14 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
             f'<div class="banner-warn">⚠️ {overflow_count} amount value(s) exceed JavaScript safe integer '
             f'({MAX_JS_INT:,}) and may display imprecisely in charts.</div>',
             unsafe_allow_html=True)
+
+
+def tab_quality_and_ageing(
+    df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict, hist_df=None
+) -> None:
+    tab_data_quality(df, df_f, col_map)
+    st.markdown("---")
+    tab_ageing_validation(df_f, col_map, hist_df)
 
 
 # ── Tab: Ageing Validation ────────────────────────────────────────────────────
@@ -1119,6 +1159,14 @@ def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
             st.plotly_chart(fig, width='stretch')
 
 
+def tab_break_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
+    _render_break_summary_kpi_row(df_f, col_map)
+    st.markdown("---")
+    tab_break_counts(df_f, col_map, hist_df)
+    st.markdown("---")
+    tab_amount_analysis(df_f, col_map, hist_df)
+
+
 # ── Tab: Amount Analysis ──────────────────────────────────────────────────────
 
 def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
@@ -1182,6 +1230,7 @@ def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
         fig.update_traces(textposition="outside")
         fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
+        fig = add_rolling_avg(fig, period_amt, "_Period_label", "total_amt", "3-Period Rolling Avg")
         st.plotly_chart(fig, width='stretch')
 
     elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
@@ -1491,6 +1540,10 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         else:
             st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
 
+    if len(period_order) < 2:
+        st.info("💡 **MoM Δ unavailable** — upload a historical file (sidebar) or ensure "
+                "the dataset spans 2+ periods to enable month-over-month comparison.")
+
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
     for c in ["Jira Description", "System to be Fixed",
@@ -1533,13 +1586,26 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             gb.configure_column("Assignee", width=150)
         if "Reporter" in summary_df.columns:
             gb.configure_column("Reporter", width=150)
-        if "Status" in summary_df.columns:
-            gb.configure_column("Status", width=110)
         if "Created Date" in summary_df.columns:
             gb.configure_column("Created Date", width=120)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
+        # Apply yellow header styling first; cell-level styling below takes final precedence
+        _apply_computed_headers(gb, summary_df.columns.tolist())
+        if "Status" in summary_df.columns:
+            status_cs = JsCode("""function(p){
+                var v=(p.value||'').toLowerCase().trim();
+                if(v==='done')
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                if(v==='to do'||v==='todo')
+                    return {'backgroundColor':'#F5F5F5','color':'#424242','fontWeight':'bold'};
+                if(v==='backlog')
+                    return {'backgroundColor':'#FFEBEE','color':'#B71C1C','fontWeight':'bold'};
+                if(['in analysis','in development','in testing'].indexOf(v)>=0)
+                    return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
+                return {};}""")
+            gb.configure_column("Status", cellStyle=status_cs, width=110)
         if "MoM Δ" in summary_df.columns:
             mom_cs = JsCode("""function(p){
                 var v=p.value;
@@ -1555,7 +1621,6 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
-        _apply_computed_headers(gb, summary_df.columns.tolist())
         AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
@@ -2533,10 +2598,20 @@ def main():
                 st.session_state["_jira_url"]   = _jira_url_inp
                 st.session_state["_jira_email"] = _jira_email_inp
                 st.session_state["_jira_token"] = _jira_token_inp
-                # Clear previously fetched metadata so next load re-fetches
-                for _k in [k for k in list(st.session_state.keys()) if k.startswith("_jira_meta_")]:
+                # Clear all Jira metadata so next tab load re-fetches with new creds
+                for _k in [k for k in list(st.session_state.keys())
+                           if k.startswith("_jira_meta_") or k == "_jira_cred_hash"]:
                     del st.session_state[_k]
                 st.success("Credentials saved. Metadata will refresh on next tab load.")
+            if st.button("🗑️ Clear Jira Metadata", key="_jira_clear_meta",
+                         help="Remove all cached Jira API results so they are re-fetched"):
+                _cleared = 0
+                for _k in [k for k in list(st.session_state.keys())
+                           if k in ("_jira_meta_store", "_jira_cred_hash")
+                           or k.startswith("_jira_meta_")]:
+                    del st.session_state[_k]
+                    _cleared += 1
+                st.success(f"Jira metadata cache cleared ({_cleared} key(s) removed).")
             if st.session_state.get("_jira_url"):
                 st.caption(f"Connected to: {st.session_state['_jira_url']}")
 
@@ -2604,27 +2679,21 @@ def main():
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
 
-    # Tabs — Period Comparison removed; historical data surfaced inside each tab
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🧹 Data Quality",
-        "📅 Ageing Validation",
-        "📈 Break Counts + Drill-Down",
-        "💷 Amount Analysis",
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🧹 Data Quality & Ageing",
+        "📊 Breaks & Amount Analysis",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
     ])
 
     with tab1:
-        tab_data_quality(df, df_f, col_map)
+        tab_quality_and_ageing(df, df_f, col_map, hist_df)
     with tab2:
-        tab_ageing_validation(df_f, col_map, hist_df)
+        tab_break_analysis(df_f, col_map, hist_df)
     with tab3:
-        tab_break_counts(df_f, col_map, hist_df)
-    with tab4:
-        tab_amount_analysis(df_f, col_map, hist_df)
-    with tab5:
         tab_jira_factor_analysis(df_f, col_map, hist_df)
-    with tab6:
+    with tab4:
         tab_fp_thresholding(df_f, col_map, hist_df)
 
 
