@@ -44,6 +44,7 @@ import math
 import os
 import re
 import tempfile
+import time
 from datetime import date as _date
 from io import BytesIO
 
@@ -234,6 +235,8 @@ _COMPUTED_HEADER_COLS = frozenset({
     "Tag for Review",
     # Derived/renamed aggregates
     "Top Jira", "Jira Desc",
+    # Ageing detail table renames
+    "Age Days", "Ageing Bucket", "Period",
 })
 _PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
 _ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
@@ -634,26 +637,36 @@ def clear_all_cache() -> int:
 
 
 def _fetch_one_issue(ref_str: str, url: str, email: str, token: str) -> tuple:
-    """Fetch a single Jira issue; creates its own connection per call (thread-safe)."""
+    """Fetch one Jira issue; per-thread connection (thread-safe). Retries on 429."""
     ref_str = ref_str.strip()
     _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
            "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
-    try:
-        conn  = _JiraClient(options={"server": url}, basic_auth=(email, token))
-        issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
-        return ref_str, {
-            "Jira Summary": issue.fields.summary or "—",
-            "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
-                            if issue.fields.assignee else "—",
-            "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
-                            if issue.fields.reporter else "—",
-            "Status":       getattr(issue.fields.status, "name", "—")
-                            if issue.fields.status else "—",
-            "Created Date": str(issue.fields.created)[:10]
-                            if issue.fields.created else "—",
-        }
-    except Exception as e:
-        return ref_str, {**_NF, "Jira Summary": f"Error: {type(e).__name__}: {str(e)[:120]}"}
+    _delays = [2, 4, 8]
+    for attempt, _delay in enumerate([0] + _delays):
+        if _delay:
+            time.sleep(_delay)
+        try:
+            conn  = _JiraClient(options={"server": url}, basic_auth=(email, token))
+            issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
+            return ref_str, {
+                "Jira Summary": issue.fields.summary or "—",
+                "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                                if issue.fields.assignee else "—",
+                "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                                if issue.fields.reporter else "—",
+                "Status":       getattr(issue.fields.status, "name", "—")
+                                if issue.fields.status else "—",
+                "Created Date": str(issue.fields.created)[:10]
+                                if issue.fields.created else "—",
+            }
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate" in err.lower():
+                if attempt < len(_delays):
+                    continue          # retry after sleep
+                return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
+            return ref_str, {**_NF, "Jira Summary": f"Error: {type(e).__name__}: {err[:120]}"}
+    return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
 
 
 def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
@@ -665,7 +678,7 @@ def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
     if not ctrls_refs:
         return {}
     total, done, result = len(ctrls_refs), 0, {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, total)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, total)) as pool:
         futures = {pool.submit(_fetch_one_issue, r, url, email, token): r
                    for r in ctrls_refs}
         for future in concurrent.futures.as_completed(futures):
@@ -930,6 +943,50 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
                        markers=True, color_discrete_sequence=[PRIMARY])
         fig3 = chart_layout(fig3, "Average Age Days Trend by Period", "Period", "Avg Age Days", height=340)
         st.plotly_chart(fig3, width='stretch')
+
+    # ── Ageing Detail: breaks > 90 days ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🔍 Breaks Exceeding 90-Day Threshold")
+
+    if "_Computed_Age_Days" in df_f.columns:
+        _age_cols = []
+        for _lbl, _key in [
+            ("Jira Reference",     "Jira Reference"),
+            ("Rec Name",           "Rec Name (as per Rec Cube)"),
+            ("System to be Fixed", "System to be Fixed"),
+            ("Team",               "Team"),
+            ("Issue Category",     "Issue Category"),
+        ]:
+            _c = col_map.get(_key)
+            if _c and _c in df_f.columns:
+                _age_cols.append(_c)
+        if "_Period_label" in df_f.columns:
+            _age_cols.append("_Period_label")
+        _age_cols += ["_Computed_Age_Days", "_Computed_Bucket"]
+        _abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+        if _abs_col and _abs_col in df_f.columns:
+            _age_cols.append(_abs_col)
+
+        _age_df = (
+            df_f[[c for c in _age_cols if c in df_f.columns]]
+            .rename(columns={
+                "_Period_label":      "Period",
+                "_Computed_Age_Days": "Age Days",
+                "_Computed_Bucket":   "Ageing Bucket",
+            })
+        )
+        _age_df = _age_df[_age_df["Age Days"] > 90].sort_values("Age Days", ascending=False)
+
+        st.caption(f"**{len(_age_df):,}** break record(s) with Age Days > 90")
+        render_grid(_age_df, height=420, key="ageing_detail_grid")
+        st.download_button(
+            "📥 Download Ageing Detail (CSV)",
+            _age_df.to_csv(index=False).encode("utf-8"),
+            file_name="ageing_breaks_over_90d.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Age data unavailable — ensure 'Age Days' or 'Date' column is mapped.")
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
@@ -1292,6 +1349,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
         mime="text/csv",
     )
+    # Raw underlying rows for current filtered upload (no internal _ columns)
+    _raw_dl = df.rename(columns={"_Period_label": "Period"})
+    _raw_dl = _raw_dl[[c for c in _raw_dl.columns if not c.startswith("_")]]
+    st.download_button(
+        "📥 Download Raw Breaks — Latest File (CSV)",
+        _raw_dl.to_csv(index=False).encode("utf-8"),
+        file_name="raw_breaks_latest.csv",
+        mime="text/csv",
+    )
 
     # ── Drill-Down: select a dimension value and break it by a secondary dim ──
     st.markdown("---")
@@ -1341,6 +1407,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _drill_src = _summary_src[
                 _summary_src[dim_col].astype(str) == _sel_val
             ].copy()
+
+            _drill_dl = _drill_src.rename(columns={"_Period_label": "Period"})
+            _drill_dl = _drill_dl[[c for c in _drill_dl.columns if not c.startswith("_")]]
+            st.download_button(
+                f"📥 Download Breaks for {_sel_val} (CSV)",
+                _drill_dl.to_csv(index=False).encode("utf-8"),
+                file_name=f"breaks_{str(_sel_val).replace('/', '_')[:40]}.csv",
+                mime="text/csv",
+            )
 
             if len(_drill_src) == 0:
                 st.info(f"No data found for {selected_label} = {_sel_val}.")
