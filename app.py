@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from datetime import date as _date
 from io import BytesIO
@@ -209,11 +210,47 @@ def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(resizable=True, sortable=True, filter=True, floatingFilter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb, df.columns.tolist())
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(df, width='stretch', height=height)
+
+
+# ── Computed-column header styling ────────────────────────────────────────────
+_COMPUTED_HEADER_COLS = frozenset({
+    # Summary / Ageing aggregates
+    "Break Count", "Avg Age Days", "Max Age Days",
+    ">90d", ">90 Day %", ">90 Day Breaks", ">180d", ">180 Day Breaks", ">365d", ">365 Day Breaks",
+    "Total ABS GBP", "Avg GBP / Break", "Unique Jira Refs",
+    # MoM analytics
+    "MoM Δ", "MoM Δ %",
+    # Jira API enrichment
+    "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
+    # FP Thresholding priority outputs
+    "Priority", "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+    "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+    "Tag for Review",
+    # Derived/renamed aggregates
+    "Top Jira", "Jira Desc",
+})
+_PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
+_ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
+_YELLOW_HEADER = {"backgroundColor": "#FFF176", "color": "#212121", "fontWeight": "bold"}
+
+
+def _is_computed_col(col: str) -> bool:
+    return (col in _COMPUTED_HEADER_COLS
+            or _PERIOD_RE.match(col) is not None
+            or _ABS_CNT_RE.match(col) is not None)
+
+
+def _apply_computed_headers(gb, df_cols) -> None:
+    """Apply yellow headerStyle to every computed/derived column in df_cols."""
+    for col in df_cols:
+        if _is_computed_col(col):
+            gb.configure_column(col, headerStyle=_YELLOW_HEADER)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -599,21 +636,19 @@ def clear_all_cache() -> int:
 def _fetch_one_issue(ref_str: str, conn) -> tuple:
     """Fetch a single Jira issue; returns (ref_str, metadata_dict)."""
     _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
-           "Reporter": "Not Found", "Epic": "Not Found"}
+           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
     try:
-        issue = conn.issue(ref_str, fields="summary,assignee,reporter,parent,customfield_10014")
-        epic_val = "—"
-        if hasattr(issue.fields, "parent") and issue.fields.parent:
-            epic_val = str(issue.fields.parent.key)
-        elif getattr(issue.fields, "customfield_10014", None):
-            epic_val = str(issue.fields.customfield_10014)
+        issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
         return ref_str, {
             "Jira Summary": issue.fields.summary or "—",
             "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
                             if issue.fields.assignee else "—",
             "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
                             if issue.fields.reporter else "—",
-            "Epic":         epic_val,
+            "Status":       getattr(issue.fields.status, "name", "—")
+                            if issue.fields.status else "—",
+            "Created Date": str(issue.fields.created)[:10]
+                            if issue.fields.created else "—",
         }
     except Exception:
         return ref_str, _NF
@@ -629,7 +664,7 @@ def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
     if not ctrls_refs:
         return {}
     _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
-           "Reporter": "Not Found", "Epic": "Not Found"}
+           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
     try:
         conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
     except Exception as e:
@@ -1421,7 +1456,8 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _store = st.session_state.setdefault("_jira_meta_store", {})
 
             _all_refs = sorted(summary_df[selected_label].astype(str).tolist())
-            _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip", "Epic": "Skip"}
+            _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip",
+                     "Status": "Skip", "Created Date": "Skip"}
 
             # Mark non-CTRLS refs as Skip immediately (no API call ever)
             for _r in _all_refs:
@@ -1451,14 +1487,14 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 .rename(columns={"index": selected_label})
             )
             summary_df = summary_df.merge(_meta_df, on=selected_label, how="left")
-            _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Epic"]
+            _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Status", "Created Date"]
         else:
             st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
 
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
     for c in ["Jira Description", "System to be Fixed",
-              "Jira Summary", "Assignee", "Reporter", "Epic",
+              "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
               "Account Group", "Products Reconciled", "Unique Jira Refs"]:
         if c in summary_df.columns: col_order.append(c)
     col_order.append("Break Count")
@@ -1497,8 +1533,10 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             gb.configure_column("Assignee", width=150)
         if "Reporter" in summary_df.columns:
             gb.configure_column("Reporter", width=150)
-        if "Epic" in summary_df.columns:
-            gb.configure_column("Epic", width=130)
+        if "Status" in summary_df.columns:
+            gb.configure_column("Status", width=110)
+        if "Created Date" in summary_df.columns:
+            gb.configure_column("Created Date", width=120)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
@@ -1517,6 +1555,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
                 return {};}""")
             gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
+        _apply_computed_headers(gb, summary_df.columns.tolist())
         AgGrid(summary_df, gridOptions=gb.build(), height=500,
                theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid",
                update_mode=GridUpdateMode.NO_UPDATE)
@@ -2228,6 +2267,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         if "Issue Category 2" in display_df.columns:
             gb_fp.configure_column("Issue Category 2", width=200)
         gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb_fp, display_df.columns.tolist())
         fp_grid = AgGrid(
             display_df,
             gridOptions=gb_fp.build(),
