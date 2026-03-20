@@ -1874,8 +1874,13 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         st.info("No segment columns (Rec Name, Team, Entity, Asset Class) found for analysis.")
         return
 
+    # Issue Category columns (resolved early so they can ride in combined)
+    issue_cat_col  = col_map.get("ISSUE CATEGORY")
+    issue_cat2_col = col_map.get("ISSUE CATEGORY2")
+    _extra_cols    = [c for c in [issue_cat_col, issue_cat2_col] if c and c in df_f.columns]
+
     # Rebuild source frames with segment cols included
-    _all_cols = seg_cols + ["_Period_label", abs_col]
+    _all_cols = seg_cols + ["_Period_label", abs_col] + _extra_cols
     _src_frames = [df_f[[c for c in _all_cols if c in df_f.columns]]]
     if (hist_df is not None and len(hist_df) > 0
             and "_Period_label" in hist_df.columns
@@ -1895,7 +1900,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     hist_periods  = period_order[:-1]
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         seg_sel = st.selectbox(
             "Primary Segment",
@@ -1907,12 +1912,19 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         )
     with c2:
         high_thresh = st.slider("High Priority threshold (%)", 20, 200, 50, 10,
-                                help="Segments where latest ABS GBP exceeds historical mean by this % → High Priority")
+                                help="Composite score must exceed historical mean by this % → High Priority")
     with c3:
         med_thresh = st.slider("Medium Priority threshold (%)", 5, 100, 20, 5,
                                help="Segments between medium and high thresholds → Medium Priority")
+    with c4:
+        cnt_weight = st.slider(
+            "Break Count Weight (%)", 0, 100, 50, 10,
+            key="_fp_cnt_weight",
+            help="Weight given to Break Count trend vs ABS GBP trend in the composite priority score. "
+                 "0 = ABS GBP only.  100 = Break Count only.  50 = equal blend."
+        )
 
-    # ── Build pivot: rows = segment values, cols = periods, values = sum ABS GBP ──
+    # ── Build ABS GBP pivot: rows = segment values, cols = periods ──────────────
     grp = combined.groupby([seg_sel, "_Period_label"])[abs_col].sum().reset_index()
     pivot = grp.pivot_table(index=seg_sel, columns="_Period_label", values=abs_col, fill_value=0)
     pivot = pivot.reset_index()
@@ -1931,7 +1943,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     pivot["Latest ABS GBP"]   = np.round(latest_data, 0)
     pivot["vs Hist Avg %"]    = np.round(dev_pct, 1)
 
-    # Trend direction: slope of linear fit across historical periods
+    # ABS GBP trend direction (slope of linear fit across historical periods)
     if len(hist_periods) >= 2:
         x = np.arange(len(hist_periods), dtype=float)
         slopes = np.array([
@@ -1942,17 +1954,56 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     else:
         pivot["Trend"] = "—"
 
-    # Priority ranking
+    # ── Break Count pivot: same structure, counting rows ─────────────────────
+    grp_cnt   = combined.groupby([seg_sel, "_Period_label"]).size().reset_index(name="_cnt")
+    pivot_cnt = grp_cnt.pivot_table(
+        index=seg_sel, columns="_Period_label", values="_cnt", fill_value=0
+    ).reset_index()
+    for p in period_order:
+        if p not in pivot_cnt.columns:
+            pivot_cnt[p] = 0.0
+    # Merge count pivot columns into main pivot (avoid column name clash)
+    pivot = pivot.merge(
+        pivot_cnt.rename(columns={p: f"_cnt_{p}" for p in period_order}),
+        on=seg_sel, how="left",
+    )
+
+    hist_cnt_cols   = [f"_cnt_{p}" for p in hist_periods]
+    hist_cnt_data   = pivot[hist_cnt_cols].values.astype(float)
+    latest_cnt_data = pivot[f"_cnt_{latest_period}"].values.astype(float)
+    hist_cnt_mean   = hist_cnt_data.mean(axis=1)
+    dev_pct_cnt     = (latest_cnt_data - hist_cnt_mean) / np.maximum(hist_cnt_mean, 1) * 100
+
+    pivot["Latest Break Count"]   = latest_cnt_data.astype(int)
+    pivot["Hist Avg Break Count"] = np.round(hist_cnt_mean, 1)
+    pivot["vs Hist Count %"]      = np.round(dev_pct_cnt, 1)
+
+    # Break count trend direction
+    if len(hist_periods) >= 2:
+        cnt_slopes = np.array([
+            np.polyfit(x, hist_cnt_data[i], 1)[0] if np.any(hist_cnt_data[i] > 0) else 0.0
+            for i in range(len(hist_cnt_data))
+        ])
+        pivot["Count Trend"] = np.where(cnt_slopes > 0, "↑ Rising",
+                               np.where(cnt_slopes < 0, "↓ Falling", "→ Stable"))
+    else:
+        pivot["Count Trend"] = "—"
+
+    # ── Composite priority score: weighted blend of ABS GBP + Break Count ────
+    w_cnt           = cnt_weight / 100.0
+    composite_score = (1.0 - w_cnt) * dev_pct + w_cnt * dev_pct_cnt
+
     conditions = [
-        dev_pct >= high_thresh,
-        dev_pct >= med_thresh,
+        composite_score >= high_thresh,
+        composite_score >= med_thresh,
     ]
     pivot["Priority"] = np.select(conditions, ["🔴 High", "🟡 Medium"], default="🟢 Low / FP Candidate")
     pivot["Tag for Review"] = pivot["Priority"] == "🔴 High"
 
-    # Per-period ABS GBP columns for display
+    # Per-period display columns
     for p in period_order:
         pivot[f"ABS {p}"] = pivot[p].round(0)
+        pivot[f"Cnt {p}"] = pivot[f"_cnt_{p}"].fillna(0).astype(int)
 
     result_df = pivot.sort_values("Priority", ascending=True).reset_index(drop=True)
 
@@ -1996,12 +2047,38 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         _jira_display_cols = [c for c in ["Top Jira", "Jira Desc", "System to be Fixed"]
                               if c in result_df.columns]
 
+    # ── Issue Category enrichment: most frequent category per segment ─────────
+    _issue_display_cols = []
+    if issue_cat_col and issue_cat_col in df_f.columns and seg_sel in df_f.columns:
+        _issue_src = [seg_sel, issue_cat_col]
+        if issue_cat2_col and issue_cat2_col in df_f.columns:
+            _issue_src.append(issue_cat2_col)
+        issue_meta = (
+            df_f[_issue_src]
+            .dropna(subset=[issue_cat_col])
+            .groupby(_issue_src)
+            .size().reset_index(name="_cnt")
+            .sort_values("_cnt", ascending=False)
+            .drop_duplicates(subset=[seg_sel])
+            .drop(columns="_cnt")
+            .rename(columns={
+                issue_cat_col: "Issue Category",
+                **({issue_cat2_col: "Issue Category 2"} if issue_cat2_col else {}),
+            })
+        )
+        result_df = result_df.merge(issue_meta, on=seg_sel, how="left")
+        _issue_display_cols = [c for c in ["Issue Category", "Issue Category 2"]
+                               if c in result_df.columns]
+
     # ── Priority table ────────────────────────────────────────────────────────
     display_cols = (
-        [seg_sel] + _jira_display_cols +
-        ["Priority", "Latest ABS GBP", "Hist Avg ABS GBP",
-         "vs Hist Avg %", "Trend", "Tag for Review"] +
-        [f"ABS {p}" for p in period_order]
+        [seg_sel] + _jira_display_cols + _issue_display_cols +
+        ["Priority",
+         "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+         "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+         "Tag for Review"] +
+        [f"ABS {p}" for p in period_order] +
+        [f"Cnt {p}" for p in period_order]
     )
     display_df = result_df[[c for c in display_cols if c in result_df.columns]]
 
@@ -2029,6 +2106,10 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
             gb_fp.configure_column("Jira Desc", width=260)
         if "System to be Fixed" in display_df.columns:
             gb_fp.configure_column("System to be Fixed", width=200)
+        if "Issue Category" in display_df.columns:
+            gb_fp.configure_column("Issue Category", width=200)
+        if "Issue Category 2" in display_df.columns:
+            gb_fp.configure_column("Issue Category 2", width=200)
         gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
         fp_grid = AgGrid(
             display_df,
@@ -2048,10 +2129,13 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
             width='stretch',
             hide_index=True,
             column_config={
-                "Tag for Review": st.column_config.CheckboxColumn("Tag for Review", default=False),
-                "Latest ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
-                "Hist Avg ABS GBP":  st.column_config.NumberColumn(format="£%.0f"),
-                "vs Hist Avg %":     st.column_config.NumberColumn(format="%.1f%%"),
+                "Tag for Review":      st.column_config.CheckboxColumn("Tag for Review", default=False),
+                "Latest ABS GBP":      st.column_config.NumberColumn(format="£%.0f"),
+                "Hist Avg ABS GBP":    st.column_config.NumberColumn(format="£%.0f"),
+                "vs Hist Avg %":       st.column_config.NumberColumn(format="%.1f%%"),
+                "Latest Break Count":  st.column_config.NumberColumn(format="%d"),
+                "Hist Avg Break Count":st.column_config.NumberColumn(format="%.1f"),
+                "vs Hist Count %":     st.column_config.NumberColumn(format="%.1f%%"),
             },
             key="_fp_editor",
         )
@@ -2079,6 +2163,19 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         fig_t = chart_layout(fig_t, f"ABS GBP Trend — Top 10 by {seg_sel}",
                              "Period", "ABS GBP (£)", height=420)
         st.plotly_chart(fig_t, width='stretch')
+
+    # ── Break Count Trend chart for top-10 segments by count ──────────────────
+    top10_by_cnt = result_df.nlargest(10, "Latest Break Count")[seg_sel].tolist()
+    cnt_trend_rows = grp_cnt[grp_cnt[seg_sel].isin(top10_by_cnt)].copy()
+    if len(cnt_trend_rows) > 0:
+        fig_c = px.line(
+            cnt_trend_rows.sort_values("_Period_label"),
+            x="_Period_label", y="_cnt", color=seg_sel,
+            color_discrete_sequence=COLORS, markers=True,
+        )
+        fig_c = chart_layout(fig_c, f"Break Count Trend — Top 10 by {seg_sel}",
+                             "Period", "Break Count", height=420)
+        st.plotly_chart(fig_c, width='stretch')
 
     # Download
     st.download_button(
