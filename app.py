@@ -37,6 +37,7 @@ ALL EXISTING FIXES RETAINED:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -595,44 +596,54 @@ def clear_all_cache() -> int:
     return deleted
 
 
-def fetch_jira_metadata(jira_refs: list, url: str, email: str, token: str) -> dict:
+def _fetch_one_issue(ref_str: str, conn) -> tuple:
+    """Fetch a single Jira issue; returns (ref_str, metadata_dict)."""
+    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+           "Reporter": "Not Found", "Epic": "Not Found"}
+    try:
+        issue = conn.issue(ref_str, fields="summary,assignee,reporter,parent,customfield_10014")
+        epic_val = "—"
+        if hasattr(issue.fields, "parent") and issue.fields.parent:
+            epic_val = str(issue.fields.parent.key)
+        elif getattr(issue.fields, "customfield_10014", None):
+            epic_val = str(issue.fields.customfield_10014)
+        return ref_str, {
+            "Jira Summary": issue.fields.summary or "—",
+            "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                            if issue.fields.assignee else "—",
+            "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                            if issue.fields.reporter else "—",
+            "Epic":         epic_val,
+        }
+    except Exception:
+        return ref_str, _NF
+
+
+def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
+                        progress_bar=None) -> dict:
     """
-    Fetch Summary, Assignee, Reporter, Epic from Jira for each ref.
-    Only refs containing 'CTRLS-' are fetched; all others are marked 'Skip'.
-    Returns dict: ref_str → {"Jira Summary": ..., "Assignee": ..., "Reporter": ..., "Epic": ...}
+    Parallel-fetch Jira metadata for pre-filtered CTRLS- refs only.
+    Caller must pass only refs not already in the store.
+    Returns dict: ref_str → metadata_dict.
     """
-    _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip", "Epic": "Skip"}
-    _NOT_FOUND = {"Jira Summary": "Not Found", "Assignee": "Not Found",
-                  "Reporter": "Not Found", "Epic": "Not Found"}
-    result = {}
+    if not ctrls_refs:
+        return {}
+    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+           "Reporter": "Not Found", "Epic": "Not Found"}
     try:
         conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
     except Exception as e:
-        return {str(r): {**_NOT_FOUND, "Jira Summary": f"Connect error: {e}"} for r in jira_refs}
+        return {r: {**_NF, "Jira Summary": f"Connect error: {e}"} for r in ctrls_refs}
 
-    for ref in jira_refs:
-        ref_str = str(ref).strip()
-        if "CTRLS-" not in ref_str.upper():
-            result[ref_str] = _SKIP
-            continue
-        try:
-            issue = conn.issue(ref_str, fields="summary,assignee,reporter,parent,customfield_10014")
-            # Epic: prefer parent key (Jira Cloud Next-gen), fall back to customfield_10014
-            epic_val = "—"
-            if hasattr(issue.fields, "parent") and issue.fields.parent:
-                epic_val = str(issue.fields.parent.key)
-            elif getattr(issue.fields, "customfield_10014", None):
-                epic_val = str(issue.fields.customfield_10014)
-            result[ref_str] = {
-                "Jira Summary": issue.fields.summary or "—",
-                "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
-                                if issue.fields.assignee else "—",
-                "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
-                                if issue.fields.reporter else "—",
-                "Epic":         epic_val,
-            }
-        except Exception:
-            result[ref_str] = _NOT_FOUND
+    total, done, result = len(ctrls_refs), 0, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, total)) as pool:
+        futures = {pool.submit(_fetch_one_issue, r, conn): r for r in ctrls_refs}
+        for future in concurrent.futures.as_completed(futures):
+            ref_str, meta = future.result()
+            result[ref_str] = meta
+            done += 1
+            if progress_bar is not None:
+                progress_bar.progress(done / total)
     return result
 
 
@@ -1395,28 +1406,45 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
              summary_df[prev].replace(0, np.nan)) * 100
         ).round(1)
 
-    # ── Live Jira Enrichment (auto-fetch when credentials present) ──────────────
+    # ── Live Jira Enrichment (incremental per-ref cache + parallel fetch) ──────────
     _jira_enriched_cols = []
     if selected_label == "Jira Reference" and HAS_JIRA:
         _jira_url   = st.session_state.get("_jira_url", "")
         _jira_email = st.session_state.get("_jira_email", "")
         _jira_token = st.session_state.get("_jira_token", "")
         if _jira_url and _jira_email and _jira_token:
-            _refs_list = sorted(summary_df[selected_label].astype(str).tolist())
-            _cache_key = "_jira_meta_" + hashlib.md5(
-                (_jira_url + _jira_email + "".join(_refs_list)).encode()
-            ).hexdigest()[:12]
-            if _cache_key not in st.session_state:
-                with st.spinner("Fetching Jira metadata for CTRLS- references…"):
-                    st.session_state[_cache_key] = fetch_jira_metadata(
-                        _refs_list, _jira_url, _jira_email, _jira_token
-                    )
-            _jira_meta  = st.session_state[_cache_key]
-            _n_fetched  = sum(1 for v in _jira_meta.values()
-                              if v.get("Jira Summary") not in ("Skip", "Not Found", "") and
-                              not str(v.get("Jira Summary", "")).startswith("Connect error"))
-            _n_skip     = sum(1 for v in _jira_meta.values() if v.get("Jira Summary") == "Skip")
-            st.caption(f"🔗 Jira metadata: **{_n_fetched}** CTRLS- fetched · **{_n_skip}** others skipped")
+            # Clear store when credentials change
+            _cred_hash = hashlib.md5((_jira_url + _jira_email + _jira_token).encode()).hexdigest()[:12]
+            if st.session_state.get("_jira_cred_hash") != _cred_hash:
+                st.session_state["_jira_cred_hash"]  = _cred_hash
+                st.session_state["_jira_meta_store"] = {}
+            _store = st.session_state.setdefault("_jira_meta_store", {})
+
+            _all_refs = sorted(summary_df[selected_label].astype(str).tolist())
+            _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip", "Epic": "Skip"}
+
+            # Mark non-CTRLS refs as Skip immediately (no API call ever)
+            for _r in _all_refs:
+                if "CTRLS-" not in _r.upper() and _r not in _store:
+                    _store[_r] = _SKIP
+
+            # Only fetch CTRLS- refs not yet in store
+            _to_fetch = [r for r in _all_refs if "CTRLS-" in r.upper() and r not in _store]
+
+            if _to_fetch:
+                _pbar = st.progress(0.0, text=f"Fetching {len(_to_fetch)} new CTRLS- ref(s)…")
+                _new  = fetch_jira_metadata(_to_fetch, _jira_url, _jira_email, _jira_token,
+                                            progress_bar=_pbar)
+                _store.update(_new)
+                _pbar.empty()
+
+            _jira_meta = {r: _store[r] for r in _all_refs if r in _store}
+            _n_fetched = sum(1 for v in _jira_meta.values()
+                             if v.get("Jira Summary") not in ("Skip", "Not Found", "")
+                             and not str(v.get("Jira Summary", "")).startswith("Connect error"))
+            _n_skip    = sum(1 for v in _jira_meta.values() if v.get("Jira Summary") == "Skip")
+            st.caption(f"🔗 Jira: **{_n_fetched}** CTRLS- fetched · **{_n_skip}** skipped · "
+                       f"**{len(_store)}** in store")
             _meta_df = (
                 pd.DataFrame.from_dict(_jira_meta, orient="index")
                 .reset_index()
