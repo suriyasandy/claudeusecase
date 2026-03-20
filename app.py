@@ -633,11 +633,13 @@ def clear_all_cache() -> int:
     return deleted
 
 
-def _fetch_one_issue(ref_str: str, conn) -> tuple:
-    """Fetch a single Jira issue; returns (ref_str, metadata_dict)."""
+def _fetch_one_issue(ref_str: str, url: str, email: str, token: str) -> tuple:
+    """Fetch a single Jira issue; creates its own connection per call (thread-safe)."""
+    ref_str = ref_str.strip()
     _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
            "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
     try:
+        conn  = _JiraClient(options={"server": url}, basic_auth=(email, token))
         issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
         return ref_str, {
             "Jira Summary": issue.fields.summary or "—",
@@ -658,21 +660,14 @@ def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
                         progress_bar=None) -> dict:
     """
     Parallel-fetch Jira metadata for pre-filtered CTRLS- refs only.
-    Caller must pass only refs not already in the store.
-    Returns dict: ref_str → metadata_dict.
+    Each worker creates its own Jira connection (thread-safe; no shared session).
     """
     if not ctrls_refs:
         return {}
-    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
-           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
-    try:
-        conn = _JiraClient(options={"server": url}, basic_auth=(email, token))
-    except Exception as e:
-        return {r: {**_NF, "Jira Summary": f"Connect error: {e}"} for r in ctrls_refs}
-
     total, done, result = len(ctrls_refs), 0, {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, total)) as pool:
-        futures = {pool.submit(_fetch_one_issue, r, conn): r for r in ctrls_refs}
+        futures = {pool.submit(_fetch_one_issue, r, url, email, token): r
+                   for r in ctrls_refs}
         for future in concurrent.futures.as_completed(futures):
             ref_str, meta = future.result()
             result[ref_str] = meta
@@ -716,26 +711,6 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 
 
 # ── Tab: Data Quality ─────────────────────────────────────────────────────────
-
-def _render_break_summary_kpi_row(df_f: pd.DataFrame, col_map: dict) -> None:
-    """Combined headline KPIs for the merged Breaks & Amount tab."""
-    abs_actual = col_map.get("ABS GBP")
-    brk_actual = col_map.get("BREAK AMOUNT GBP")
-    amt_col = abs_actual or brk_actual
-    if not amt_col or amt_col not in df_f.columns:
-        return
-    total_breaks = len(df_f)
-    total_amt    = df_f[amt_col].abs().sum()
-    avg_per_brk  = total_amt / max(total_breaks, 1)
-    k1, k2, k3  = st.columns(3)
-    with k1:
-        kpi_card("Total Breaks", format_number(total_breaks))
-    with k2:
-        kpi_card("Total ABS Exposure (£)", format_short(total_amt))
-    with k3:
-        kpi_card("Avg ABS per Break (£)", format_short(avg_per_brk),
-                 "Financial weight per break")
-
 
 def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> None:
     st.markdown("## 🧹 Data Quality Report")
@@ -955,324 +930,6 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
                        markers=True, color_discrete_sequence=[PRIMARY])
         fig3 = chart_layout(fig3, "Average Age Days Trend by Period", "Period", "Avg Age Days", height=340)
         st.plotly_chart(fig3, width='stretch')
-
-
-# ── Tab: Break Counts + Drill-Down ────────────────────────────────────────────
-
-def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 📈 Break Counts + Drill-Down")
-
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
-
-    if "_Period_label" not in df_f.columns:
-        st.info("No period data available.")
-        return
-
-    # Top-10 Rec Names trend
-    if rec_actual and rec_actual in df_f.columns:
-        # Combine hist + current so trend spans all available periods
-        _trend_cols = [rec_actual, "_Period_label"]
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and rec_actual in hist_df.columns):
-            _trend_src = pd.concat(
-                [hist_df[_trend_cols], df_f[_trend_cols]], ignore_index=True
-            )
-        else:
-            _trend_src = df_f[_trend_cols]
-        top10_series = _trend_src[rec_actual].value_counts().head(10).index.tolist()
-        top10_df = _trend_src[_trend_src[rec_actual].isin(top10_series)]
-        trend = (
-            top10_df.groupby(["_Period_label", rec_actual])
-            .size()
-            .reset_index(name="Count")
-            .sort_values("_Period_label")
-        )
-        fig = px.line(
-            trend, x="_Period_label", y="Count", color=rec_actual,
-            color_discrete_sequence=COLORS, markers=True,
-        )
-        fig = chart_layout(fig, "Top-10 Rec Names — Break Count Trend", "Period", "Count", height=420)
-        st.plotly_chart(fig, width='stretch')
-
-        st.markdown("---")
-        # ── Drill-Down Section ────────────────────────────────────────────────
-        st.markdown("### 🔍 Drill-Down by Rec Name")
-        all_recs = sorted(df_f[rec_actual].dropna().astype(str).unique().tolist())
-
-        # Validate session state before rendering selectbox (Change 10)
-        if st.session_state.get("_drill_rec") not in all_recs:
-            st.session_state["_drill_rec"] = top10_series[0] if top10_series else (all_recs[0] if all_recs else None)
-
-        if all_recs:
-            selected_rec = st.selectbox(
-                "Select Rec Name to drill into:",
-                all_recs,
-                index=all_recs.index(st.session_state["_drill_rec"]) if st.session_state.get("_drill_rec") in all_recs else 0,
-                key="_drill_rec",
-            )
-
-            st.markdown(
-                f'<div class="banner-drill">🔬 Drilling into: <b>{selected_rec}</b></div>',
-                unsafe_allow_html=True)
-
-            rec_df = df_f[df_f[rec_actual].astype(str) == selected_rec].copy()
-
-            # Build combined source (hist + current) for trend charts
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns
-                    and rec_actual in hist_df.columns):
-                rec_hist_df = hist_df[hist_df[rec_actual].astype(str) == selected_rec].copy()
-                rec_combined_df = pd.concat([rec_hist_df, rec_df], ignore_index=True)
-            else:
-                rec_combined_df = rec_df
-
-            if len(rec_df) == 0:
-                st.warning("No data for selected Rec Name.")
-            else:
-                st.markdown(f"**{format_number(len(rec_df))} breaks** in this Rec")
-
-                with st.container():
-                    st.markdown('<div class="drill-section">', unsafe_allow_html=True)
-
-                    # ── Toggle controls ───────────────────────────────────────
-                    entity_actual = col_map.get("Entity")
-                    type_actual   = col_map.get("Type of Break")
-                    ac_actual     = col_map.get("Asset Class")
-                    abs_actual    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
-
-                    # Build available breakdown dims (only those present in data)
-                    _dim_opts = []
-                    if team_actual   and team_actual   in rec_df.columns: _dim_opts.append("Team")
-                    if entity_actual and entity_actual in rec_df.columns: _dim_opts.append("Entity")
-                    if type_actual   and type_actual   in rec_df.columns: _dim_opts.append("Type of Break")
-                    if ac_actual     and ac_actual     in rec_df.columns: _dim_opts.append("Asset Class")
-
-                    _has_amount = bool(abs_actual and abs_actual in rec_df.columns)
-                    _metric_opts = ["Count", "Amount"] if _has_amount else ["Count"]
-
-                    tc1, tc2 = st.columns([2, 3])
-                    with tc1:
-                        _drill_metric = st.radio(
-                            "Metric", _metric_opts, horizontal=True,
-                            key="_drill_metric",
-                        )
-                    with tc2:
-                        if _dim_opts:
-                            _drill_dim = st.selectbox(
-                                "Breakdown by", _dim_opts, key="_drill_dim",
-                            )
-                        else:
-                            _drill_dim = None
-
-                    # ── Single chart based on toggle selection ─────────────────
-                    if _drill_metric == "Count" and _drill_dim:
-                        _dim_col = {
-                            "Team":          team_actual,
-                            "Entity":        entity_actual,
-                            "Type of Break": type_actual,
-                            "Asset Class":   ac_actual,
-                        }[_drill_dim]
-                        period_cnt = dq_local(
-                            f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                            f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(
-                            period_cnt, x="_Period_label", y="cnt", color=_dim_col,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_d = chart_layout(
-                            fig_d,
-                            f"Breaks by Period × {_drill_dim} — {selected_rec}",
-                            "Period", "Count", height=380,
-                        )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Count" and not _drill_dim:
-                        # Fallback: plain period trend
-                        period_cnt = dq_local(
-                            'SELECT "_Period_label", COUNT(*) AS cnt '
-                            'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
-                                       color_discrete_sequence=[PRIMARY])
-                        fig_d = chart_layout(fig_d, f"Breaks by Period — {selected_rec}",
-                                             "Period", "Count", height=360)
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Amount":
-                        if _drill_dim and _drill_dim in ("Team", "Entity"):
-                            _dim_col = team_actual if _drill_dim == "Team" else entity_actual
-                            period_amt_stk = dq_local(
-                                f'SELECT "_Period_label", "{_dim_col}", '
-                                f'SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                                f'ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(
-                                period_amt_stk, x="_Period_label", y="total_amt",
-                                color=_dim_col, color_discrete_sequence=COLORS, barmode="stack",
-                            )
-                            fig_d = chart_layout(
-                                fig_d,
-                                f"ABS GBP by Period × {_drill_dim} — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=380,
-                            )
-                        else:
-                            # Amount by period only (no useful stack for Type/Asset Class)
-                            period_amt = dq_local(
-                                f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
-                                           color_discrete_sequence=[PRIMARY])
-                            fig_d.update_traces(
-                                text=[format_short(v) for v in period_amt["total_amt"]],
-                                textposition="outside",
-                            )
-                            fig_d = chart_layout(
-                                fig_d, f"ABS GBP by Period — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=360,
-                            )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        # No rec column — show overall period trend using hist+current data
-        if "_Period_label" in df_f.columns:
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns):
-                _all_src = pd.concat(
-                    [hist_df[["_Period_label"]], df_f[["_Period_label"]]], ignore_index=True
-                )
-            else:
-                _all_src = df_f[["_Period_label"]]
-            period_cnt = _all_src.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
-            fig = px.bar(period_cnt, x="_Period_label", y="Count", color_discrete_sequence=[PRIMARY])
-            fig = chart_layout(fig, "Break Count by Period", "Period", "Count", height=380)
-            st.plotly_chart(fig, width='stretch')
-
-
-def tab_break_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    _render_break_summary_kpi_row(df_f, col_map)
-    st.markdown("---")
-    tab_break_counts(df_f, col_map, hist_df)
-    st.markdown("---")
-    tab_amount_analysis(df_f, col_map, hist_df)
-
-
-# ── Tab: Amount Analysis ──────────────────────────────────────────────────────
-
-def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 💷 Amount Analysis")
-
-    abs_actual = col_map.get("ABS GBP")
-    brk_actual = col_map.get("BREAK AMOUNT GBP")
-    amt_col = abs_actual or brk_actual
-
-    if not amt_col or amt_col not in df_f.columns:
-        st.info("No amount column found. Ensure 'ABS GBP' or 'BREAK AMOUNT GBP' is present.")
-        return
-
-    total_amt = df_f[amt_col].abs().sum()
-    avg_amt   = df_f[amt_col].abs().mean()
-    max_amt   = df_f[amt_col].abs().max()
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        kpi_card("Total ABS Amount (£)", format_short(total_amt))
-    with k2:
-        kpi_card("Avg ABS Amount (£)", format_short(avg_amt))
-    with k3:
-        kpi_card("Max ABS Amount (£)", format_short(max_amt))
-    with k4:
-        kpi_card("Total Breaks", format_number(len(df_f)))
-
-    st.markdown("---")
-
-    # ── Chart view toggle ─────────────────────────────────────────────────────
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
-
-    _view_opts = ["By Period"]
-    if rec_actual  and rec_actual  in df_f.columns: _view_opts.append("By Rec Name")
-    if team_actual and team_actual in df_f.columns: _view_opts.append("By Team")
-    _view_opts.append("Distribution")
-
-    _amt_view = st.radio("View", _view_opts, horizontal=True, key="_amt_view")
-
-    if _amt_view == "By Period" and "_Period_label" in df_f.columns:
-        # Merge historical periods so the chart shows full trend
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and amt_col in hist_df.columns):
-            _period_src = pd.concat(
-                [hist_df[["_Period_label", amt_col]],
-                 df_f[["_Period_label", amt_col]]], ignore_index=True
-            )
-        else:
-            _period_src = df_f[["_Period_label", amt_col]]
-        period_amt = dq_local(
-            f'SELECT "_Period_label", SUM({safe_amt(amt_col)}) AS total_amt '
-            f'FROM tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-            tbl=_period_src
-        )
-        fig = px.bar(
-            period_amt, x="_Period_label", y="total_amt",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in period_amt["total_amt"]],
-        )
-        fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
-        fig = add_rolling_avg(fig, period_amt, "_Period_label", "total_amt", "3-Period Rolling Avg")
-        st.plotly_chart(fig, width='stretch')
-
-    elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
-        rec_amt = (
-            df_f.groupby(rec_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-        )
-        rec_amt.columns = [rec_actual, "Total ABS (£)"]
-        fig2 = px.bar(
-            rec_amt, x=rec_actual, y="Total ABS (£)",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in rec_amt["Total ABS (£)"]],
-        )
-        fig2.update_traces(textposition="outside")
-        fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=420)
-        st.plotly_chart(fig2, width='stretch')
-
-    elif _amt_view == "By Team" and team_actual and team_actual in df_f.columns:
-        team_amt = (
-            df_f.groupby(team_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .reset_index()
-        )
-        team_amt.columns = [team_actual, "Total ABS (£)"]
-        fig3 = px.bar(
-            team_amt, x=team_actual, y="Total ABS (£)",
-            color_discrete_sequence=COLORS[:len(team_amt)],
-            text=[format_short(v) for v in team_amt["Total ABS (£)"]],
-        )
-        fig3.update_traces(textposition="outside")
-        fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=400)
-        st.plotly_chart(fig3, width='stretch')
-
-    else:  # Distribution
-        amt_data = df_f[amt_col].dropna()
-        fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
-        fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=400)
-        st.plotly_chart(fig4, width='stretch')
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
@@ -1504,7 +1161,8 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 st.session_state["_jira_meta_store"] = {}
             _store = st.session_state.setdefault("_jira_meta_store", {})
 
-            _all_refs = sorted(summary_df[selected_label].astype(str).tolist())
+            _all_refs = sorted({str(r).strip() for r in summary_df[selected_label].tolist()
+                                if str(r).strip() not in ("", "nan", "None")})
             _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip",
                      "Status": "Skip", "Created Date": "Skip"}
 
@@ -2680,9 +2338,8 @@ def main():
     df_f = apply_filters(df, filters)
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
         "🧹 Data Quality & Ageing",
-        "📊 Breaks & Amount Analysis",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
     ])
@@ -2690,10 +2347,8 @@ def main():
     with tab1:
         tab_quality_and_ageing(df, df_f, col_map, hist_df)
     with tab2:
-        tab_break_analysis(df_f, col_map, hist_df)
-    with tab3:
         tab_jira_factor_analysis(df_f, col_map, hist_df)
-    with tab4:
+    with tab3:
         tab_fp_thresholding(df_f, col_map, hist_df)
 
 
