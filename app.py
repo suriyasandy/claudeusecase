@@ -58,6 +58,12 @@ try:
 except ImportError:
     HAS_AGGRID = False
 
+try:
+    from jira import JIRA as _JiraClient
+    HAS_JIRA = True
+except ImportError:
+    HAS_JIRA = False
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Accounting Control AI Platform",
@@ -587,6 +593,47 @@ def clear_all_cache() -> int:
         except Exception:
             pass
     return deleted
+
+
+def fetch_jira_metadata(jira_refs: list, url: str, email: str, token: str) -> dict:
+    """
+    Fetch Summary, Assignee, Reporter, Epic from Jira for each ref.
+    Only refs containing 'CTRLS-' are fetched; all others are marked 'Skip'.
+    Returns dict: ref_str → {"Jira Summary": ..., "Assignee": ..., "Reporter": ..., "Epic": ...}
+    """
+    _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip", "Epic": "Skip"}
+    _NOT_FOUND = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+                  "Reporter": "Not Found", "Epic": "Not Found"}
+    result = {}
+    try:
+        conn = _JiraClient(server=url, basic_auth=(email, token), max_retries=1)
+    except Exception as e:
+        return {str(r): {**_NOT_FOUND, "Jira Summary": f"Connect error: {e}"} for r in jira_refs}
+
+    for ref in jira_refs:
+        ref_str = str(ref).strip()
+        if "CTRLS-" not in ref_str.upper():
+            result[ref_str] = _SKIP
+            continue
+        try:
+            issue = conn.issue(ref_str, fields="summary,assignee,reporter,parent,customfield_10014")
+            # Epic: prefer parent key (Jira Cloud Next-gen), fall back to customfield_10014
+            epic_val = "—"
+            if hasattr(issue.fields, "parent") and issue.fields.parent:
+                epic_val = str(issue.fields.parent.key)
+            elif getattr(issue.fields, "customfield_10014", None):
+                epic_val = str(issue.fields.customfield_10014)
+            result[ref_str] = {
+                "Jira Summary": issue.fields.summary or "—",
+                "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                                if issue.fields.assignee else "—",
+                "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                                if issue.fields.reporter else "—",
+                "Epic":         epic_val,
+            }
+        except Exception:
+            result[ref_str] = _NOT_FOUND
+    return result
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -1348,10 +1395,43 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
              summary_df[prev].replace(0, np.nan)) * 100
         ).round(1)
 
+    # ── Live Jira Enrichment (auto-fetch when credentials present) ──────────────
+    _jira_enriched_cols = []
+    if selected_label == "Jira Reference" and HAS_JIRA:
+        _jira_url   = st.session_state.get("_jira_url", "")
+        _jira_email = st.session_state.get("_jira_email", "")
+        _jira_token = st.session_state.get("_jira_token", "")
+        if _jira_url and _jira_email and _jira_token:
+            _refs_list = sorted(summary_df[selected_label].astype(str).tolist())
+            _cache_key = "_jira_meta_" + hashlib.md5(
+                (_jira_url + _jira_email + "".join(_refs_list)).encode()
+            ).hexdigest()[:12]
+            if _cache_key not in st.session_state:
+                with st.spinner("Fetching Jira metadata for CTRLS- references…"):
+                    st.session_state[_cache_key] = fetch_jira_metadata(
+                        _refs_list, _jira_url, _jira_email, _jira_token
+                    )
+            _jira_meta  = st.session_state[_cache_key]
+            _n_fetched  = sum(1 for v in _jira_meta.values()
+                              if v.get("Jira Summary") not in ("Skip", "Not Found", "") and
+                              not str(v.get("Jira Summary", "")).startswith("Connect error"))
+            _n_skip     = sum(1 for v in _jira_meta.values() if v.get("Jira Summary") == "Skip")
+            st.caption(f"🔗 Jira metadata: **{_n_fetched}** CTRLS- fetched · **{_n_skip}** others skipped")
+            _meta_df = (
+                pd.DataFrame.from_dict(_jira_meta, orient="index")
+                .reset_index()
+                .rename(columns={"index": selected_label})
+            )
+            summary_df = summary_df.merge(_meta_df, on=selected_label, how="left")
+            _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Epic"]
+        else:
+            st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
+
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
-    for c in ["Jira Description", "System to be Fixed", "Account Group",
-              "Products Reconciled", "Unique Jira Refs"]:
+    for c in ["Jira Description", "System to be Fixed",
+              "Jira Summary", "Assignee", "Reporter", "Epic",
+              "Account Group", "Products Reconciled", "Unique Jira Refs"]:
         if c in summary_df.columns: col_order.append(c)
     col_order.append("Break Count")
     # All period columns in chronological order
@@ -1383,6 +1463,14 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                                 tooltipField="Jira Description")
         if "System to be Fixed" in summary_df.columns:
             gb.configure_column("System to be Fixed", width=200)
+        if "Jira Summary" in summary_df.columns:
+            gb.configure_column("Jira Summary", width=300, tooltipField="Jira Summary")
+        if "Assignee" in summary_df.columns:
+            gb.configure_column("Assignee", width=150)
+        if "Reporter" in summary_df.columns:
+            gb.configure_column("Reporter", width=150)
+        if "Epic" in summary_df.columns:
+            gb.configure_column("Epic", width=130)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
@@ -2357,6 +2445,32 @@ def main():
             n = clear_all_cache()
             st.success(f"Cleared {n} cached file(s). Upload a new file to begin.")
             st.rerun()
+
+    # ── Jira Integration ──
+    with st.sidebar.expander("🔗 Jira Integration", expanded=False):
+        if not HAS_JIRA:
+            st.warning("Install the `jira` package to enable live Jira enrichment.\n\n`pip install jira`")
+        else:
+            st.caption("Credentials are used only this session and never stored to disk.")
+            _jira_url_inp   = st.text_input(
+                "Jira URL", value=st.session_state.get("_jira_url", ""),
+                placeholder="https://yourcompany.atlassian.net", key="_jira_url_inp")
+            _jira_email_inp = st.text_input(
+                "Email", value=st.session_state.get("_jira_email", ""),
+                key="_jira_email_inp")
+            _jira_token_inp = st.text_input(
+                "API Token", value=st.session_state.get("_jira_token", ""),
+                type="password", key="_jira_token_inp")
+            if st.button("Save Credentials", key="_jira_save"):
+                st.session_state["_jira_url"]   = _jira_url_inp
+                st.session_state["_jira_email"] = _jira_email_inp
+                st.session_state["_jira_token"] = _jira_token_inp
+                # Clear previously fetched metadata so next load re-fetches
+                for _k in [k for k in list(st.session_state.keys()) if k.startswith("_jira_meta_")]:
+                    del st.session_state[_k]
+                st.success("Credentials saved. Metadata will refresh on next tab load.")
+            if st.session_state.get("_jira_url"):
+                st.caption(f"Connected to: {st.session_state['_jira_url']}")
 
     uploaded_latest = st.sidebar.file_uploader(
         "📂 Latest Period File",
