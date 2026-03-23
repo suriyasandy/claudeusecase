@@ -288,6 +288,108 @@ def safe_amt(col: str) -> str:
     return f"TRY_CAST(\"{col}\" AS DOUBLE)"
 
 
+@st.cache_data(show_spinner=False)
+def _compute_trade_recurring(
+    df_key_hash: str,          # cache-bust key (md5 of shape+cols)
+    _df: pd.DataFrame,         # underscore prefix → Streamlit skips hashing this
+    rec_col: str,
+    trade_ref_col: str,
+    abs_col: str | None,
+):
+    """Pre-compute Trade ID Recurring Analysis.  Cached by df_key_hash so it
+    runs only once per unique dataset, regardless of which factor is selected."""
+    _has_abs = bool(abs_col)
+    _abs_cte_expr = f', ROUND(AVG(ABS("{abs_col}")), 2) AS avg_break_val_p' if _has_abs else ""
+    _abs_sel_expr = ', ROUND(AVG(avg_break_val_p), 2) AS "Avg Break Value"'  if _has_abs else ""
+
+    _trade_stats = dq_local(f"""
+        WITH period_counts AS (
+            SELECT
+                "{rec_col}"        AS rec_name,
+                "{trade_ref_col}"  AS trade_id,
+                _Period_label      AS period,
+                COUNT(*)           AS cnt_in_period
+                {_abs_cte_expr}
+            FROM tbl
+            WHERE "{rec_col}" IS NOT NULL
+              AND "{trade_ref_col}" IS NOT NULL
+              AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
+                  NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+        )
+        SELECT
+            rec_name AS "RecName",
+            trade_id AS "Trade ID",
+            COUNT(DISTINCT period)  AS distinct_periods,
+            MAX(cnt_in_period)      AS max_in_period,
+            SUM(cnt_in_period)      AS total_occurrences
+            {_abs_sel_expr}
+        FROM period_counts
+        GROUP BY rec_name, trade_id
+        ORDER BY rec_name, trade_id
+    """, tbl=_df)
+
+    def _classify_trade(row):
+        if row["distinct_periods"] >= 2:
+            return "Recurring"
+        if row["max_in_period"] >= 2:
+            return "Duplicate (same period)"
+        return "New"
+
+    _trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
+
+    # Stale detection: recurring + same break value across all periods
+    if _has_abs and "Avg Break Value" in _trade_stats.columns:
+        _stale_check = dq_local(f"""
+            SELECT
+                "{rec_col}"       AS rec_name,
+                "{trade_ref_col}" AS trade_id,
+                COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
+                COUNT(DISTINCT _Period_label)              AS period_count
+            FROM tbl
+            WHERE "{rec_col}" IS NOT NULL
+              AND "{trade_ref_col}" IS NOT NULL
+              AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
+                  NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{rec_col}", "{trade_ref_col}"
+        """, tbl=_df)
+        _stale_check["is_stale"] = (
+            (_stale_check["period_count"] >= 2) &
+            (_stale_check["distinct_break_vals"] == 1)
+        )
+        _stale_map = _stale_check.set_index(["rec_name", "trade_id"])["is_stale"].to_dict()
+        _trade_stats["is_stale"] = _trade_stats.apply(
+            lambda r: _stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
+        )
+    else:
+        _trade_stats["is_stale"] = False
+
+    # Aggregate to RecName level
+    _rec_summary = (
+        _trade_stats.groupby("RecName")
+        .agg(
+            unique_tradeid_count  =("Trade ID",        "count"),
+            recurring_count       =("distinct_periods", lambda x: (x >= 2).sum()),
+            stale_count           =("is_stale",         "sum"),
+            duplicate_count       =("max_in_period",    lambda x: (x >= 2).sum()),
+        )
+        .reset_index()
+    )
+    _rec_summary.columns = [
+        "RecName",
+        "Unique Tradeid Count",
+        "No. of Recurring Tradeids",
+        "No. of Stale Breaks",
+        "No. of Duplicate Tradeids",
+    ]
+    _rec_summary["No. of Stale Breaks"]       = _rec_summary["No. of Stale Breaks"].astype(int)
+    _rec_summary["No. of Recurring Tradeids"] = _rec_summary["No. of Recurring Tradeids"].astype(int)
+    _rec_summary["No. of Duplicate Tradeids"] = _rec_summary["No. of Duplicate Tradeids"].astype(int)
+    _rec_summary = _rec_summary.sort_values("No. of Recurring Tradeids", ascending=False)
+
+    return _trade_stats, _rec_summary
+
+
 # ── Parquet cache functions ───────────────────────────────────────────────────
 
 def _cache_dir() -> str:
@@ -1165,6 +1267,23 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     else:
         _summary_src = df
 
+    # ── Pre-compute Trade ID Recurring Analysis (cached, runs once per dataset) ──
+    _trade_ref_col = col_map.get("TRADE REF")
+    _cached_trade_stats: pd.DataFrame | None = None
+    _cached_rec_summary: pd.DataFrame | None = None
+    if (
+        _trade_ref_col and _trade_ref_col in _summary_src.columns
+        and rec_col and rec_col in _summary_src.columns
+        and "_Period_label" in _summary_src.columns
+    ):
+        _src_hash = hashlib.md5(
+            f"{_summary_src.shape}{list(_summary_src.columns)}".encode()
+        ).hexdigest()
+        _abs_for_cache = abs_col if (abs_col and abs_col in _summary_src.columns) else None
+        _cached_trade_stats, _cached_rec_summary = _compute_trade_recurring(
+            _src_hash, _summary_src, rec_col, _trade_ref_col, _abs_for_cache
+        )
+
     summary_df = dq(f"""
         SELECT
             "{dim_col}"  AS "{selected_label}",
@@ -1359,213 +1478,128 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         mime="text/csv",
     )
 
-    # ── RecName Trade ID Recurring Analysis ─────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### RecName — Trade ID Recurring Analysis")
+    # ── RecName Trade ID Recurring Analysis (shown only when Rec Name factor is selected) ──
+    if selected_label == "Rec Name":
+        st.markdown("---")
+        st.markdown("### RecName — Trade ID Recurring Analysis")
 
-    _trade_ref_col = col_map.get("TRADE REF")
-    if (
-        _trade_ref_col and _trade_ref_col in _summary_src.columns
-        and rec_col and rec_col in _summary_src.columns
-        and "_Period_label" in _summary_src.columns
-    ):
-        # ── Build trade-level stats: distinct periods + max occurrences within a period ──
-        _has_abs = bool(abs_col and abs_col in _summary_src.columns)
-        _abs_cte_expr = f', ROUND(AVG(ABS("{abs_col}")), 2) AS avg_break_val_p' if _has_abs else ""
-        _abs_sel_expr = ', ROUND(AVG(avg_break_val_p), 2) AS "Avg Break Value"'  if _has_abs else ""
+        if _cached_rec_summary is not None:
+            # Use pre-computed (cached) results — no heavy query on rerender
+            _trade_stats  = _cached_trade_stats
+            _rec_summary  = _cached_rec_summary
 
-        _trade_stats = dq_local(f"""
-            WITH period_counts AS (
-                SELECT
-                    "{rec_col}"        AS rec_name,
-                    "{_trade_ref_col}" AS trade_id,
-                    _Period_label      AS period,
-                    COUNT(*)           AS cnt_in_period
-                    {_abs_cte_expr}
-                FROM tbl
-                WHERE "{rec_col}" IS NOT NULL
-                  AND "{_trade_ref_col}" IS NOT NULL
-                  AND TRIM(CAST("{_trade_ref_col}" AS VARCHAR))
-                      NOT IN ('','nan','None','N/A','-')
-                GROUP BY "{rec_col}", "{_trade_ref_col}", _Period_label
+            st.caption(
+                "**Recurring** = same Trade ID in ≥ 2 distinct periods (stale if break value unchanged). "
+                "**Duplicate** = same Trade ID appearing ≥ 2 times within the same period. "
+                "**New** = Trade ID seen in only one period, once."
             )
-            SELECT
-                rec_name AS "RecName",
-                trade_id AS "Trade ID",
-                COUNT(DISTINCT period)  AS distinct_periods,
-                MAX(cnt_in_period)      AS max_in_period,
-                SUM(cnt_in_period)      AS total_occurrences
-                {_abs_sel_expr}
-            FROM period_counts
-            GROUP BY rec_name, trade_id
-            ORDER BY rec_name, trade_id
-        """, tbl=_summary_src)
 
-        # ── Classify each trade ID ──
-        def _classify_trade(row):
-            if row["distinct_periods"] >= 2:
-                return "Recurring"
-            if row["max_in_period"] >= 2:
-                return "Duplicate (same period)"
-            return "New"
+            _sel_rec_name = None
+            if HAS_AGGRID:
+                _gb_rec = GridOptionsBuilder.from_dataframe(_rec_summary)
+                _gb_rec.configure_selection("single", use_checkbox=True)
+                _gb_rec.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+                _gb_rec.configure_default_column(sortable=True, resizable=True, filter=True)
+                _gb_rec.configure_column("RecName", pinned="left", width=200)
+                for _c in ["Unique Tradeid Count", "No. of Recurring Tradeids",
+                           "No. of Stale Breaks", "No. of Duplicate Tradeids"]:
+                    _gb_rec.configure_column(_c, width=160)
+                _stale_cs = JsCode("""function(p){
+                    var v=parseInt(p.value);
+                    if(v>0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                    return {};}""")
+                _gb_rec.configure_column("No. of Stale Breaks", cellStyle=_stale_cs)
+                _rec_grid_resp = AgGrid(
+                    _rec_summary,
+                    gridOptions=_gb_rec.build(),
+                    height=400,
+                    theme="streamlit",
+                    allow_unsafe_jscode=True,
+                    key="recname_tradeid_summary_grid",
+                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                )
+                # ── Fix: handle both DataFrame and list-of-dict returns from AgGrid ──
+                _sel_rows = _rec_grid_resp.get("selected_rows")
+                _sel_rec_name = None
+                if _sel_rows is not None:
+                    if isinstance(_sel_rows, pd.DataFrame):
+                        if len(_sel_rows) > 0:
+                            _sel_rec_name = _sel_rows.iloc[0]["RecName"]
+                    elif isinstance(_sel_rows, list) and len(_sel_rows) > 0:
+                        _first = _sel_rows[0]
+                        _sel_rec_name = _first["RecName"] if isinstance(_first, dict) else str(_first)
+            else:
+                st.dataframe(_rec_summary, height=400)
+                _sel_rec_name = st.selectbox(
+                    "Select RecName to view Trade ID details:",
+                    [""] + _rec_summary["RecName"].tolist(),
+                    key="recname_tradeid_sel",
+                ) or None
 
-        _trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
+            # ── Detail view for selected RecName ─────────────────────────────
+            if _sel_rec_name:
+                st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
+                _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
+                _detail_disp = _detail.rename(columns={
+                    "distinct_periods": "Periods Seen",
+                    "max_in_period":    "Max in Single Period",
+                    "total_occurrences":"Total Occurrences",
+                    "is_stale":         "Stale",
+                })
+                _show_cols = ["Trade ID", "Type", "Periods Seen",
+                              "Max in Single Period", "Total Occurrences", "Stale"]
+                if "Avg Break Value" in _detail_disp.columns:
+                    _show_cols.insert(3, "Avg Break Value")
+                st.dataframe(
+                    _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]],
+                    height=350,
+                )
 
-        # ── Stale detection: recurring + same break value across all periods ──
-        if abs_col and abs_col in _summary_src.columns and "Avg Break Value" in _trade_stats.columns:
-            _stale_check = dq_local(f"""
-                SELECT
-                    "{rec_col}"        AS rec_name,
-                    "{_trade_ref_col}" AS trade_id,
-                    COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
-                    COUNT(DISTINCT _Period_label)              AS period_count
-                FROM tbl
-                WHERE "{rec_col}" IS NOT NULL
-                  AND "{_trade_ref_col}" IS NOT NULL
-                  AND TRIM(CAST("{_trade_ref_col}" AS VARCHAR))
-                      NOT IN ('','nan','None','N/A','-')
-                GROUP BY "{rec_col}", "{_trade_ref_col}"
-            """, tbl=_summary_src)
-            _stale_check["is_stale"] = (
-                (_stale_check["period_count"] >= 2) &
-                (_stale_check["distinct_break_vals"] == 1)
-            )
-            _stale_map = _stale_check.set_index(["rec_name", "trade_id"])["is_stale"].to_dict()
-            _trade_stats["is_stale"] = _trade_stats.apply(
-                lambda r: _stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
-            )
+                # ── Downloads ────────────────────────────────────────────────
+                _dl_col1, _dl_col2 = st.columns(2)
+
+                _stale_ids = _detail.loc[_detail["Type"] == "Recurring", "Trade ID"].tolist()
+                _stale_src = _summary_src[
+                    (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                    (_summary_src[_trade_ref_col].isin(_stale_ids))
+                ].copy()
+                _stale_dl = _stale_src.rename(columns={"_Period_label": "Period"})
+                _stale_dl = _stale_dl[[c for c in _stale_dl.columns if not c.startswith("_")]]
+
+                with _dl_col1:
+                    st.download_button(
+                        f"📥 Download Stale Data — {str(_sel_rec_name)[:30]}",
+                        _stale_dl.to_csv(index=False).encode("utf-8"),
+                        file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_stale",
+                    )
+
+                _new_ids = _detail.loc[_detail["Type"] == "New", "Trade ID"].tolist()
+                _new_src = _summary_src[
+                    (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                    (_summary_src[_trade_ref_col].isin(_new_ids))
+                ].copy()
+                _new_dl = _new_src.rename(columns={"_Period_label": "Period"})
+                _new_dl = _new_dl[[c for c in _new_dl.columns if not c.startswith("_")]]
+
+                with _dl_col2:
+                    st.download_button(
+                        f"📥 Download New / Non-Reoccurred — {str(_sel_rec_name)[:30]}",
+                        _new_dl.to_csv(index=False).encode("utf-8"),
+                        file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_new",
+                    )
         else:
-            _trade_stats["is_stale"] = False
-
-        # ── Aggregate to RecName level ──
-        _rec_summary = (
-            _trade_stats.groupby("RecName")
-            .agg(
-                unique_tradeid_count  =("Trade ID",        "count"),
-                recurring_count       =("distinct_periods", lambda x: (x >= 2).sum()),
-                stale_count           =("is_stale",         "sum"),
-                duplicate_count       =("max_in_period",    lambda x: (x >= 2).sum()),
+            st.info(
+                "💡 **RecName Trade ID Summary** requires a **'TRADE REF'** column in your data "
+                "to detect recurring and stale breaks across periods."
             )
-            .reset_index()
-        )
-        _rec_summary.columns = [
-            "RecName",
-            "Unique Tradeid Count",
-            "No. of Recurring Tradeids",
-            "No. of Stale Breaks",
-            "No. of Duplicate Tradeids",
-        ]
-        _rec_summary["No. of Stale Breaks"]      = _rec_summary["No. of Stale Breaks"].astype(int)
-        _rec_summary["No. of Recurring Tradeids"] = _rec_summary["No. of Recurring Tradeids"].astype(int)
-        _rec_summary["No. of Duplicate Tradeids"] = _rec_summary["No. of Duplicate Tradeids"].astype(int)
-        _rec_summary = _rec_summary.sort_values("No. of Recurring Tradeids", ascending=False)
-
-        st.caption(
-            "**Recurring** = same Trade ID in ≥ 2 distinct periods (stale if break value unchanged). "
-            "**Duplicate** = same Trade ID appearing ≥ 2 times within the same period. "
-            "**New** = Trade ID seen in only one period, once."
-        )
-
-        _sel_rec_name = None
-        if HAS_AGGRID:
-            _gb_rec = GridOptionsBuilder.from_dataframe(_rec_summary)
-            _gb_rec.configure_selection("single", use_checkbox=True)
-            _gb_rec.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
-            _gb_rec.configure_default_column(sortable=True, resizable=True, filter=True)
-            _gb_rec.configure_column("RecName", pinned="left", width=200)
-            for _c in ["Unique Tradeid Count", "No. of Recurring Tradeids",
-                       "No. of Stale Breaks", "No. of Duplicate Tradeids"]:
-                _gb_rec.configure_column(_c, width=160)
-            _stale_cs = JsCode("""function(p){
-                var v=parseInt(p.value);
-                if(v>0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
-                return {};}""")
-            _gb_rec.configure_column("No. of Stale Breaks", cellStyle=_stale_cs)
-            _rec_grid_resp = AgGrid(
-                _rec_summary,
-                gridOptions=_gb_rec.build(),
-                height=400,
-                theme="streamlit",
-                allow_unsafe_jscode=True,
-                key="recname_tradeid_summary_grid",
-                update_mode=GridUpdateMode.SELECTION_CHANGED,
-            )
-            _sel_rows = _rec_grid_resp.get("selected_rows")
-            if _sel_rows is not None and len(_sel_rows) > 0:
-                _sel_rec_name = (
-                    _sel_rows[0]["RecName"]
-                    if isinstance(_sel_rows[0], dict)
-                    else _sel_rows.iloc[0]["RecName"]
-                )
-        else:
-            st.dataframe(_rec_summary, height=400)
-            _sel_rec_name = st.selectbox(
-                "Select RecName to view Trade ID details:",
-                [""] + _rec_summary["RecName"].tolist(),
-                key="recname_tradeid_sel",
-            ) or None
-
-        # ── Detail view for selected RecName ─────────────────────────────────
-        if _sel_rec_name:
-            st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
-            _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
-            _detail_disp = _detail.rename(columns={
-                "distinct_periods": "Periods Seen",
-                "max_in_period":    "Max in Single Period",
-                "total_occurrences":"Total Occurrences",
-                "is_stale":         "Stale",
-            })
-            _show_cols = ["Trade ID", "Type", "Periods Seen",
-                          "Max in Single Period", "Total Occurrences", "Stale"]
-            if "Avg Break Value" in _detail_disp.columns:
-                _show_cols.insert(3, "Avg Break Value")
-            st.dataframe(
-                _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]],
-                height=350,
-            )
-
-            # ── Downloads ────────────────────────────────────────────────────
-            _dl_col1, _dl_col2 = st.columns(2)
-
-            # Stale data: recurring trade IDs present across 2+ periods
-            _stale_ids = _detail.loc[_detail["Type"] == "Recurring", "Trade ID"].tolist()
-            _stale_src = _summary_src[
-                (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
-                (_summary_src[_trade_ref_col].isin(_stale_ids))
-            ].copy()
-            _stale_dl = _stale_src.rename(columns={"_Period_label": "Period"})
-            _stale_dl = _stale_dl[[c for c in _stale_dl.columns if not c.startswith("_")]]
-
-            with _dl_col1:
-                st.download_button(
-                    f"📥 Download Stale Data — {str(_sel_rec_name)[:30]}",
-                    _stale_dl.to_csv(index=False).encode("utf-8"),
-                    file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
-                    mime="text/csv",
-                    key="recname_dl_stale",
-                )
-
-            # New / non-reoccurred data: trade IDs in only 1 period
-            _new_ids = _detail.loc[_detail["Type"] == "New", "Trade ID"].tolist()
-            _new_src = _summary_src[
-                (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
-                (_summary_src[_trade_ref_col].isin(_new_ids))
-            ].copy()
-            _new_dl = _new_src.rename(columns={"_Period_label": "Period"})
-            _new_dl = _new_dl[[c for c in _new_dl.columns if not c.startswith("_")]]
-
-            with _dl_col2:
-                st.download_button(
-                    f"📥 Download New / Non-Reoccurred — {str(_sel_rec_name)[:30]}",
-                    _new_dl.to_csv(index=False).encode("utf-8"),
-                    file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
-                    mime="text/csv",
-                    key="recname_dl_new",
-                )
-    else:
+    elif _cached_rec_summary is not None:
         st.info(
-            "💡 **RecName Trade ID Summary** requires a **'TRADE REF'** column in your data "
-            "to detect recurring and stale breaks across periods."
+            "💡 Switch the factor dimension to **Rec Name** to view the "
+            "Trade ID Recurring Analysis table (pre-computed and ready)."
         )
 
     # ── Drill-Down: select a dimension value and break it by a secondary dim ──
