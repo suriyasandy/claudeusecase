@@ -136,7 +136,7 @@ def format_short(val) -> str:
         return "N/A"
     abs_v = abs(v)
     if abs_v >= 1e15:
-        return f"{v/1e15:.1f}P"
+        return f"{v/1e15:.1f}Q"
     if abs_v >= 1e12:
         return f"{v/1e12:.1f}T"
     if abs_v >= 1e9:
@@ -1359,6 +1359,215 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         mime="text/csv",
     )
 
+    # ── RecName Trade ID Recurring Analysis ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### RecName — Trade ID Recurring Analysis")
+
+    _trade_ref_col = col_map.get("TRADE REF")
+    if (
+        _trade_ref_col and _trade_ref_col in _summary_src.columns
+        and rec_col and rec_col in _summary_src.columns
+        and "_Period_label" in _summary_src.columns
+    ):
+        # ── Build trade-level stats: distinct periods + max occurrences within a period ──
+        _has_abs = bool(abs_col and abs_col in _summary_src.columns)
+        _abs_cte_expr = f', ROUND(AVG(ABS("{abs_col}")), 2) AS avg_break_val_p' if _has_abs else ""
+        _abs_sel_expr = ', ROUND(AVG(avg_break_val_p), 2) AS "Avg Break Value"'  if _has_abs else ""
+
+        _trade_stats = dq_local(f"""
+            WITH period_counts AS (
+                SELECT
+                    "{rec_col}"        AS rec_name,
+                    "{_trade_ref_col}" AS trade_id,
+                    _Period_label      AS period,
+                    COUNT(*)           AS cnt_in_period
+                    {_abs_cte_expr}
+                FROM tbl
+                WHERE "{rec_col}" IS NOT NULL
+                  AND "{_trade_ref_col}" IS NOT NULL
+                  AND TRIM(CAST("{_trade_ref_col}" AS VARCHAR))
+                      NOT IN ('','nan','None','N/A','-')
+                GROUP BY "{rec_col}", "{_trade_ref_col}", _Period_label
+            )
+            SELECT
+                rec_name AS "RecName",
+                trade_id AS "Trade ID",
+                COUNT(DISTINCT period)  AS distinct_periods,
+                MAX(cnt_in_period)      AS max_in_period,
+                SUM(cnt_in_period)      AS total_occurrences
+                {_abs_sel_expr}
+            FROM period_counts
+            GROUP BY rec_name, trade_id
+            ORDER BY rec_name, trade_id
+        """, tbl=_summary_src)
+
+        # ── Classify each trade ID ──
+        def _classify_trade(row):
+            if row["distinct_periods"] >= 2:
+                return "Recurring"
+            if row["max_in_period"] >= 2:
+                return "Duplicate (same period)"
+            return "New"
+
+        _trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
+
+        # ── Stale detection: recurring + same break value across all periods ──
+        if abs_col and abs_col in _summary_src.columns and "Avg Break Value" in _trade_stats.columns:
+            _stale_check = dq_local(f"""
+                SELECT
+                    "{rec_col}"        AS rec_name,
+                    "{_trade_ref_col}" AS trade_id,
+                    COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
+                    COUNT(DISTINCT _Period_label)              AS period_count
+                FROM tbl
+                WHERE "{rec_col}" IS NOT NULL
+                  AND "{_trade_ref_col}" IS NOT NULL
+                  AND TRIM(CAST("{_trade_ref_col}" AS VARCHAR))
+                      NOT IN ('','nan','None','N/A','-')
+                GROUP BY "{rec_col}", "{_trade_ref_col}"
+            """, tbl=_summary_src)
+            _stale_check["is_stale"] = (
+                (_stale_check["period_count"] >= 2) &
+                (_stale_check["distinct_break_vals"] == 1)
+            )
+            _stale_map = _stale_check.set_index(["rec_name", "trade_id"])["is_stale"].to_dict()
+            _trade_stats["is_stale"] = _trade_stats.apply(
+                lambda r: _stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
+            )
+        else:
+            _trade_stats["is_stale"] = False
+
+        # ── Aggregate to RecName level ──
+        _rec_summary = (
+            _trade_stats.groupby("RecName")
+            .agg(
+                unique_tradeid_count  =("Trade ID",        "count"),
+                recurring_count       =("distinct_periods", lambda x: (x >= 2).sum()),
+                stale_count           =("is_stale",         "sum"),
+                duplicate_count       =("max_in_period",    lambda x: (x >= 2).sum()),
+            )
+            .reset_index()
+        )
+        _rec_summary.columns = [
+            "RecName",
+            "Unique Tradeid Count",
+            "No. of Recurring Tradeids",
+            "No. of Stale Breaks",
+            "No. of Duplicate Tradeids",
+        ]
+        _rec_summary["No. of Stale Breaks"]      = _rec_summary["No. of Stale Breaks"].astype(int)
+        _rec_summary["No. of Recurring Tradeids"] = _rec_summary["No. of Recurring Tradeids"].astype(int)
+        _rec_summary["No. of Duplicate Tradeids"] = _rec_summary["No. of Duplicate Tradeids"].astype(int)
+        _rec_summary = _rec_summary.sort_values("No. of Recurring Tradeids", ascending=False)
+
+        st.caption(
+            "**Recurring** = same Trade ID in ≥ 2 distinct periods (stale if break value unchanged). "
+            "**Duplicate** = same Trade ID appearing ≥ 2 times within the same period. "
+            "**New** = Trade ID seen in only one period, once."
+        )
+
+        _sel_rec_name = None
+        if HAS_AGGRID:
+            _gb_rec = GridOptionsBuilder.from_dataframe(_rec_summary)
+            _gb_rec.configure_selection("single", use_checkbox=True)
+            _gb_rec.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+            _gb_rec.configure_default_column(sortable=True, resizable=True, filter=True)
+            _gb_rec.configure_column("RecName", pinned="left", width=200)
+            for _c in ["Unique Tradeid Count", "No. of Recurring Tradeids",
+                       "No. of Stale Breaks", "No. of Duplicate Tradeids"]:
+                _gb_rec.configure_column(_c, width=160)
+            _stale_cs = JsCode("""function(p){
+                var v=parseInt(p.value);
+                if(v>0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                return {};}""")
+            _gb_rec.configure_column("No. of Stale Breaks", cellStyle=_stale_cs)
+            _rec_grid_resp = AgGrid(
+                _rec_summary,
+                gridOptions=_gb_rec.build(),
+                height=400,
+                theme="streamlit",
+                allow_unsafe_jscode=True,
+                key="recname_tradeid_summary_grid",
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+            )
+            _sel_rows = _rec_grid_resp.get("selected_rows")
+            if _sel_rows is not None and len(_sel_rows) > 0:
+                _sel_rec_name = (
+                    _sel_rows[0]["RecName"]
+                    if isinstance(_sel_rows[0], dict)
+                    else _sel_rows.iloc[0]["RecName"]
+                )
+        else:
+            st.dataframe(_rec_summary, height=400)
+            _sel_rec_name = st.selectbox(
+                "Select RecName to view Trade ID details:",
+                [""] + _rec_summary["RecName"].tolist(),
+                key="recname_tradeid_sel",
+            ) or None
+
+        # ── Detail view for selected RecName ─────────────────────────────────
+        if _sel_rec_name:
+            st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
+            _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
+            _detail_disp = _detail.rename(columns={
+                "distinct_periods": "Periods Seen",
+                "max_in_period":    "Max in Single Period",
+                "total_occurrences":"Total Occurrences",
+                "is_stale":         "Stale",
+            })
+            _show_cols = ["Trade ID", "Type", "Periods Seen",
+                          "Max in Single Period", "Total Occurrences", "Stale"]
+            if "Avg Break Value" in _detail_disp.columns:
+                _show_cols.insert(3, "Avg Break Value")
+            st.dataframe(
+                _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]],
+                height=350,
+            )
+
+            # ── Downloads ────────────────────────────────────────────────────
+            _dl_col1, _dl_col2 = st.columns(2)
+
+            # Stale data: recurring trade IDs present across 2+ periods
+            _stale_ids = _detail.loc[_detail["Type"] == "Recurring", "Trade ID"].tolist()
+            _stale_src = _summary_src[
+                (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                (_summary_src[_trade_ref_col].isin(_stale_ids))
+            ].copy()
+            _stale_dl = _stale_src.rename(columns={"_Period_label": "Period"})
+            _stale_dl = _stale_dl[[c for c in _stale_dl.columns if not c.startswith("_")]]
+
+            with _dl_col1:
+                st.download_button(
+                    f"📥 Download Stale Data — {str(_sel_rec_name)[:30]}",
+                    _stale_dl.to_csv(index=False).encode("utf-8"),
+                    file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                    mime="text/csv",
+                    key="recname_dl_stale",
+                )
+
+            # New / non-reoccurred data: trade IDs in only 1 period
+            _new_ids = _detail.loc[_detail["Type"] == "New", "Trade ID"].tolist()
+            _new_src = _summary_src[
+                (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                (_summary_src[_trade_ref_col].isin(_new_ids))
+            ].copy()
+            _new_dl = _new_src.rename(columns={"_Period_label": "Period"})
+            _new_dl = _new_dl[[c for c in _new_dl.columns if not c.startswith("_")]]
+
+            with _dl_col2:
+                st.download_button(
+                    f"📥 Download New / Non-Reoccurred — {str(_sel_rec_name)[:30]}",
+                    _new_dl.to_csv(index=False).encode("utf-8"),
+                    file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                    mime="text/csv",
+                    key="recname_dl_new",
+                )
+    else:
+        st.info(
+            "💡 **RecName Trade ID Summary** requires a **'TRADE REF'** column in your data "
+            "to detect recurring and stale breaks across periods."
+        )
+
     # ── Drill-Down: select a dimension value and break it by a secondary dim ──
     st.markdown("---")
     st.markdown(f"### Drill-Down: {selected_label} → Secondary Breakdown")
@@ -1477,119 +1686,31 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     # ─────────────────────────────────────────────────────────────────────
     dmap = _desc_map() if selected_label == "Jira Reference" else {}
 
-    row1a, row1b = st.columns(2)
-
     # ── Chart 1: Top 15 by Break Count ──
-    with row1a:
-        top_cnt = dq(f"""
-            SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
-            FROM tbl
-            WHERE "{dim_col}" IS NOT NULL
-              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-            GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
-        """, df).sort_values("cnt", ascending=True)
+    top_cnt = dq(f"""
+        SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
+        FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+          AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+        GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
+    """, df).sort_values("cnt", ascending=True)
 
-        if dmap:
-            top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
-            fig = go.Figure(go.Bar(
-                x=top_cnt["cnt"], y=top_cnt["factor"],
-                orientation="h", marker_color=PRIMARY,
-                text=top_cnt["cnt"], textposition="outside",
-                customdata=top_cnt["hover_desc"],
-                hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
-            ))
-        else:
-            fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
-                         color_discrete_sequence=[PRIMARY], text="cnt")
-            fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
-                           "Break Count", "", height=max(360, len(top_cnt) * 32))
-        st.plotly_chart(fig, width='stretch')
-
-    # ── Chart 2: Risk Matrix — Age vs Break Count (bubble = ABS GBP) ──
-    with row1b:
-        if "_Computed_Age_Days" in df.columns:
-            _abs_expr = (
-                f', ROUND(SUM(ABS("{abs_col}")), 0) AS total_abs'
-                if abs_col and abs_col in df.columns else ""
-            )
-            risk_matrix = dq(f"""
-                SELECT "{dim_col}" AS factor,
-                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age,
-                       COUNT(*) AS brk_cnt
-                       {_abs_expr}
-                FROM tbl
-                WHERE "{dim_col}" IS NOT NULL
-                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-                  AND _Computed_Age_Days IS NOT NULL
-                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 20
-            """, df)
-
-            if len(risk_matrix) > 0:
-                bubble_colors = [
-                    WARN      if v > 180 else
-                    COLORS[8] if v > 90  else
-                    COLORS[0]
-                    for v in risk_matrix["avg_age"]
-                ]
-                if "total_abs" in risk_matrix.columns:
-                    max_abs = risk_matrix["total_abs"].replace(0, np.nan).max() or 1
-                    bubble_sizes = (
-                        (risk_matrix["total_abs"].fillna(0) / max_abs * 50 + 10)
-                        .clip(10, 60).tolist()
-                    )
-                    size_label = risk_matrix["total_abs"].apply(format_short)
-                else:
-                    bubble_sizes = [20] * len(risk_matrix)
-                    size_label = pd.Series(["N/A"] * len(risk_matrix))
-
-                if dmap:
-                    risk_matrix["hover_desc"] = risk_matrix["factor"].map(dmap).fillna("")
-                    htext = (
-                        "<b>%{customdata[0]}</b><br>%{customdata[1]}<br>"
-                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
-                        "ABS GBP: %{customdata[2]}<extra></extra>"
-                    )
-                    cdata = list(zip(
-                        risk_matrix["factor"],
-                        risk_matrix["hover_desc"],
-                        size_label,
-                    ))
-                else:
-                    htext = (
-                        "<b>%{customdata[0]}</b><br>"
-                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
-                        "ABS GBP: %{customdata[1]}<extra></extra>"
-                    )
-                    cdata = list(zip(risk_matrix["factor"], size_label))
-
-                fig = go.Figure(go.Scatter(
-                    x=risk_matrix["avg_age"],
-                    y=risk_matrix["brk_cnt"],
-                    mode="markers+text",
-                    text=risk_matrix["factor"].apply(
-                        lambda v: (str(v)[:18] + "…") if len(str(v)) > 18 else str(v)
-                    ),
-                    textposition="top center",
-                    textfont=dict(size=9),
-                    marker=dict(
-                        size=bubble_sizes,
-                        color=bubble_colors,
-                        opacity=0.75,
-                        line=dict(width=1, color="white"),
-                    ),
-                    customdata=cdata,
-                    hovertemplate=htext,
-                ))
-                fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
-                              annotation_text="90d",  annotation_position="top right")
-                fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
-                              annotation_text="180d", annotation_position="top right")
-                fig = chart_layout(fig,
-                    f"Risk Matrix: {selected_label} — Age vs Break Count",
-                    "Avg Age Days", "Break Count", height=420)
-                fig.update_xaxes(type="linear")
-                st.plotly_chart(fig, width='stretch')
+    if dmap:
+        top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
+        fig = go.Figure(go.Bar(
+            x=top_cnt["cnt"], y=top_cnt["factor"],
+            orientation="h", marker_color=PRIMARY,
+            text=top_cnt["cnt"], textposition="outside",
+            customdata=top_cnt["hover_desc"],
+            hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
+        ))
+    else:
+        fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
+                     color_discrete_sequence=[PRIMARY], text="cnt")
+        fig.update_traces(textposition="outside")
+    fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
+                       "Break Count", "", height=max(360, len(top_cnt) * 32))
+    st.plotly_chart(fig, width='stretch')
 
     if abs_col and abs_col in df.columns:
         row2a, row2b = st.columns(2)
@@ -1746,54 +1867,6 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         st.caption("🟩 Teal = More breaks this period (worse)   "
                    "🟥 Red = Fewer breaks this period (improvement)")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Jira Reference × System to be Fixed heatmap
-    # ─────────────────────────────────────────────────────────────────────
-    if (jira_ref_col  and jira_ref_col  in df.columns and
-            system_col and system_col in df.columns):
-        st.markdown("### Jira Reference × System to be Fixed — Break Count Heatmap")
-        cross = dq(f"""
-            SELECT "{jira_ref_col}" AS jira_ref,
-                   "{system_col}"   AS system_fix,
-                   COUNT(*)         AS cnt
-            FROM tbl
-            WHERE "{jira_ref_col}" IS NOT NULL AND "{system_col}" IS NOT NULL
-              AND TRIM(CAST("{jira_ref_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-              AND TRIM(CAST("{system_col}"   AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-            GROUP BY "{jira_ref_col}", "{system_col}"
-        """, df)
-
-        if len(cross) > 0:
-            if jira_desc_col and jira_desc_col in df.columns:
-                desc_map_h = dq(f"""
-                    SELECT "{jira_ref_col}" AS ref,
-                           FIRST("{jira_desc_col}") AS d
-                    FROM tbl WHERE "{jira_ref_col}" IS NOT NULL
-                    GROUP BY "{jira_ref_col}"
-                """, df).set_index("ref")["d"].to_dict()
-                cross["jira_label"] = cross["jira_ref"].apply(
-                    lambda x: _short_label(x, desc_map_h, max_chars=30))
-            else:
-                cross["jira_label"] = cross["jira_ref"]
-
-            pivot = cross.pivot_table(
-                index="jira_label", columns="system_fix",
-                values="cnt", fill_value=0)
-            jira_totals = cross.groupby("jira_label")["cnt"].sum()
-            top20_labels = jira_totals.nlargest(20).index
-            pivot = pivot.loc[pivot.index.isin(top20_labels)]
-
-            fig = px.imshow(
-                pivot,
-                color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
-                aspect="auto", text_auto=".0f",
-            )
-            fig = chart_layout(fig,
-                "Jira Reference × System to be Fixed (Top 20 Jiras — Break Count)",
-                "", "", height=max(400, len(pivot) * 30))
-            st.plotly_chart(fig, width='stretch')
-        else:
-            st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
 
 
 # ── Tab: FP Thresholding ──────────────────────────────────────────────────────
