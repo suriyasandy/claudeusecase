@@ -364,6 +364,11 @@ def _compute_trade_recurring(
     else:
         _trade_stats["is_stale"] = False
 
+    # Promote "Recurring" → "Recurring + Stale" where stale flag is True
+    _trade_stats.loc[
+        _trade_stats["is_stale"] & (_trade_stats["Type"] == "Recurring"), "Type"
+    ] = "Recurring + Stale"
+
     # Aggregate to RecName level
     _rec_summary = (
         _trade_stats.groupby("RecName")
@@ -385,7 +390,10 @@ def _compute_trade_recurring(
     _rec_summary["No. of Stale Breaks"]       = _rec_summary["No. of Stale Breaks"].astype(int)
     _rec_summary["No. of Recurring Tradeids"] = _rec_summary["No. of Recurring Tradeids"].astype(int)
     _rec_summary["No. of Duplicate Tradeids"] = _rec_summary["No. of Duplicate Tradeids"].astype(int)
-    _rec_summary = _rec_summary.sort_values("No. of Recurring Tradeids", ascending=False)
+    _rec_summary = _rec_summary.sort_values(
+        "No. of Recurring Tradeids", ascending=False
+    ).reset_index(drop=True)
+    _trade_stats = _trade_stats.reset_index(drop=True)
 
     return _trade_stats, _rec_summary
 
@@ -1510,7 +1518,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                     return {};}""")
                 _gb_rec.configure_column("No. of Stale Breaks", cellStyle=_stale_cs)
                 _rec_grid_resp = AgGrid(
-                    _rec_summary,
+                    _rec_summary.reset_index(drop=True),
                     gridOptions=_gb_rec.build(),
                     height=400,
                     theme="streamlit",
@@ -1541,24 +1549,60 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
                 _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
                 _detail_disp = _detail.rename(columns={
-                    "distinct_periods": "Periods Seen",
-                    "max_in_period":    "Max in Single Period",
-                    "total_occurrences":"Total Occurrences",
-                    "is_stale":         "Stale",
+                    "distinct_periods":  "Periods Seen",
+                    "max_in_period":     "Max in Single Period",
+                    "total_occurrences": "Total Occurrences",
                 })
+                # "Stale" removed — merged into Type as "Recurring + Stale"
                 _show_cols = ["Trade ID", "Type", "Periods Seen",
-                              "Max in Single Period", "Total Occurrences", "Stale"]
+                              "Max in Single Period", "Total Occurrences"]
                 if "Avg Break Value" in _detail_disp.columns:
                     _show_cols.insert(3, "Avg Break Value")
-                st.dataframe(
-                    _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]],
-                    height=350,
+                _detail_disp = (
+                    _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]]
+                    .reset_index(drop=True)
                 )
+
+                if HAS_AGGRID:
+                    _type_cs = JsCode("""function(p){
+                        var v=(p.value||'').trim();
+                        if(v==='Recurring + Stale')
+                            return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                        if(v==='Recurring')
+                            return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                        if(v==='Duplicate (same period)')
+                            return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
+                        if(v==='New')
+                            return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                        return {};}""")
+                    _gb_det = GridOptionsBuilder.from_dataframe(_detail_disp)
+                    _gb_det.configure_default_column(sortable=True, resizable=True, filter=True)
+                    _gb_det.configure_column("Trade ID", pinned="left", width=180)
+                    _gb_det.configure_column("Type", cellStyle=_type_cs, width=190)
+                    _gb_det.configure_column("Periods Seen", width=120)
+                    _gb_det.configure_column("Max in Single Period", width=160)
+                    _gb_det.configure_column("Total Occurrences", width=150)
+                    if "Avg Break Value" in _detail_disp.columns:
+                        _gb_det.configure_column("Avg Break Value", width=140)
+                    _gb_det.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+                    AgGrid(
+                        _detail_disp,
+                        gridOptions=_gb_det.build(),
+                        height=380,
+                        theme="streamlit",
+                        allow_unsafe_jscode=True,
+                        key="recname_tradeid_detail_grid",
+                        update_mode=GridUpdateMode.NO_UPDATE,
+                    )
+                else:
+                    st.dataframe(_detail_disp, height=350)
 
                 # ── Downloads ────────────────────────────────────────────────
                 _dl_col1, _dl_col2 = st.columns(2)
 
-                _stale_ids = _detail.loc[_detail["Type"] == "Recurring", "Trade ID"].tolist()
+                _stale_ids = _detail.loc[
+                    _detail["Type"].isin(["Recurring", "Recurring + Stale"]), "Trade ID"
+                ].tolist()
                 _stale_src = _summary_src[
                     (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
                     (_summary_src[_trade_ref_col].isin(_stale_ids))
@@ -1591,6 +1635,88 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                         mime="text/csv",
                         key="recname_dl_new",
                     )
+
+                # ── Distribution chart for selected RecName ───────────────────
+                _type_col_chart = col_map.get("Type of Break")
+                _chart_dims = {
+                    k: v for k, v in {
+                        "Asset Class":   ac_col,
+                        "Entity":        entity_col,
+                        "True/Systemic": ts_col,
+                        "Type of Break": _type_col_chart,
+                    }.items()
+                    if v and v in _summary_src.columns
+                }
+
+                if _chart_dims:
+                    st.markdown("---")
+                    st.markdown(f"#### Trade ID Distribution — **{_sel_rec_name}**")
+
+                    # Raw rows for selected RecName
+                    _sel_raw = _summary_src[
+                        _summary_src[rec_col].astype(str) == str(_sel_rec_name)
+                    ].copy()
+
+                    # Map Trade ID → Type (from pre-computed stats)
+                    _type_map = dict(zip(
+                        _trade_stats["Trade ID"].astype(str),
+                        _trade_stats["Type"],
+                    ))
+                    _sel_raw["_TType"] = (
+                        _sel_raw[_trade_ref_col].astype(str).map(_type_map).fillna("Unknown")
+                    )
+
+                    # One row per distinct Trade ID — first value per dimension
+                    _agg_d = {"_TType": "first"}
+                    _agg_d.update({v: "first" for v in _chart_dims.values()})
+                    _per_trade = (
+                        _sel_raw.groupby(_sel_raw[_trade_ref_col].astype(str), sort=False)
+                        .agg(_agg_d)
+                        .reset_index()
+                        .rename(columns={_trade_ref_col: "Trade ID"})
+                    )
+
+                    _type_color_map = {
+                        "Recurring + Stale":      "#A84B2F",
+                        "Recurring":              "#FFC553",
+                        "Duplicate (same period)":"#4F98A3",
+                        "New":                    "#01696F",
+                        "Unknown":                "#7A7974",
+                    }
+
+                    _chart_items = list(_chart_dims.items())
+                    for _ci in range(0, len(_chart_items), 2):
+                        _row_cols = st.columns(min(2, len(_chart_items) - _ci))
+                        for _cj, (_dlabel, _dcol_name) in enumerate(_chart_items[_ci:_ci + 2]):
+                            with _row_cols[_cj]:
+                                _grp = (
+                                    _per_trade.groupby([_dcol_name, "_TType"], sort=False)
+                                    .size()
+                                    .reset_index(name="Trade ID Count")
+                                    .rename(columns={_dcol_name: _dlabel, "_TType": "Type"})
+                                )
+                                _fig_dist = px.bar(
+                                    _grp,
+                                    x="Trade ID Count",
+                                    y=_dlabel,
+                                    color="Type",
+                                    color_discrete_map=_type_color_map,
+                                    orientation="h",
+                                    barmode="stack",
+                                    text="Trade ID Count",
+                                )
+                                _fig_dist = chart_layout(
+                                    _fig_dist,
+                                    f"By {_dlabel}",
+                                    "Trade ID Count",
+                                    _dlabel,
+                                    height=max(300, _grp[_dlabel].nunique() * 45 + 120),
+                                )
+                                _fig_dist.update_traces(
+                                    textposition="inside", textfont_size=11
+                                )
+                                _fig_dist.update_layout(legend_title_text="Type")
+                                st.plotly_chart(_fig_dist, use_container_width=True)
         else:
             st.info(
                 "💡 **RecName Trade ID Summary** requires a **'TRADE REF'** column in your data "
