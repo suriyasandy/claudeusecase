@@ -302,6 +302,15 @@ def _compute_trade_recurring(
     _abs_cte_expr = f', ROUND(AVG(ABS("{abs_col}")), 2) AS avg_break_val_p' if _has_abs else ""
     _abs_sel_expr = ', ROUND(AVG(avg_break_val_p), 2) AS "Avg Break Value"'  if _has_abs else ""
 
+    # Shared WHERE clause used across all queries in this function
+    _W = f"""
+        "{rec_col}" IS NOT NULL
+        AND "{trade_ref_col}" IS NOT NULL
+        AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
+            NOT IN ('','nan','None','N/A','-')
+    """
+
+    # ── Main trade stats ──────────────────────────────────────────────────────
     _trade_stats = dq_local(f"""
         WITH period_counts AS (
             SELECT
@@ -311,10 +320,7 @@ def _compute_trade_recurring(
                 COUNT(*)           AS cnt_in_period
                 {_abs_cte_expr}
             FROM tbl
-            WHERE "{rec_col}" IS NOT NULL
-              AND "{trade_ref_col}" IS NOT NULL
-              AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
-                  NOT IN ('','nan','None','N/A','-')
+            WHERE {_W}
             GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
         )
         SELECT
@@ -329,6 +335,25 @@ def _compute_trade_recurring(
         ORDER BY rec_name, trade_id
     """, tbl=_df)
 
+    # ── Period breakdown string: "Jan-24 ×3 | Feb-24 ×1" ────────────────────
+    _period_brkdown = dq_local(f"""
+        WITH pc AS (
+            SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                   _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl
+            WHERE {_W}
+            GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+        )
+        SELECT rec_name  AS "RecName",
+               trade_id  AS "Trade ID",
+               STRING_AGG(period || ' ×' || CAST(cnt AS VARCHAR), ' | '
+                          ORDER BY period) AS "Period Breakdown"
+        FROM pc
+        GROUP BY rec_name, trade_id
+    """, tbl=_df)
+    _trade_stats = _trade_stats.merge(_period_brkdown, on=["RecName", "Trade ID"], how="left")
+
+    # ── Classify each trade ID ────────────────────────────────────────────────
     def _classify_trade(row):
         if row["distinct_periods"] >= 2:
             return "Recurring"
@@ -338,19 +363,15 @@ def _compute_trade_recurring(
 
     _trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
 
-    # Stale detection: recurring + same break value across all periods
+    # ── Stale detection (requires break amount column) ────────────────────────
     if _has_abs and "Avg Break Value" in _trade_stats.columns:
+        # Recurring stale: same break value across ALL periods
         _stale_check = dq_local(f"""
-            SELECT
-                "{rec_col}"       AS rec_name,
-                "{trade_ref_col}" AS trade_id,
-                COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
-                COUNT(DISTINCT _Period_label)              AS period_count
+            SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                   COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
+                   COUNT(DISTINCT _Period_label)              AS period_count
             FROM tbl
-            WHERE "{rec_col}" IS NOT NULL
-              AND "{trade_ref_col}" IS NOT NULL
-              AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
-                  NOT IN ('','nan','None','N/A','-')
+            WHERE {_W}
             GROUP BY "{rec_col}", "{trade_ref_col}"
         """, tbl=_df)
         _stale_check["is_stale"] = (
@@ -361,22 +382,71 @@ def _compute_trade_recurring(
         _trade_stats["is_stale"] = _trade_stats.apply(
             lambda r: _stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
         )
-    else:
-        _trade_stats["is_stale"] = False
 
-    # Promote "Recurring" → "Recurring + Stale" where stale flag is True
+        # Duplicate+Stale: appears ≥2× in same period with identical break value
+        _dup_stale_q = dq_local(f"""
+            WITH dup_p AS (
+                SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                       _Period_label AS period, COUNT(*) AS cnt,
+                       COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_vals
+                FROM tbl
+                WHERE {_W}
+                GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+                HAVING cnt >= 2
+            )
+            SELECT rec_name, trade_id,
+                   BOOL_OR(distinct_vals = 1) AS is_dup_stale
+            FROM dup_p
+            GROUP BY rec_name, trade_id
+        """, tbl=_df)
+        _dup_stale_map = _dup_stale_q.set_index(
+            ["rec_name", "trade_id"]
+        )["is_dup_stale"].to_dict()
+        _trade_stats["is_dup_stale"] = _trade_stats.apply(
+            lambda r: _dup_stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
+        )
+
+        # Excess break amount for duplicates: (cnt_in_period − 1) × avg_val summed
+        _dup_excess = dq_local(f"""
+            WITH dup_p AS (
+                SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                       COUNT(*) AS cnt,
+                       ROUND(AVG(ABS("{abs_col}")), 2) AS avg_val
+                FROM tbl
+                WHERE {_W}
+                GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+                HAVING cnt >= 2
+            )
+            SELECT rec_name  AS "RecName",
+                   trade_id  AS "Trade ID",
+                   ROUND(SUM((cnt - 1) * avg_val), 2) AS "Excess Break (Dup)"
+            FROM dup_p
+            GROUP BY rec_name, trade_id
+        """, tbl=_df)
+        _trade_stats = _trade_stats.merge(
+            _dup_excess, on=["RecName", "Trade ID"], how="left"
+        )
+    else:
+        _trade_stats["is_stale"]    = False
+        _trade_stats["is_dup_stale"] = False
+
+    # ── Promote Type with stale flags ─────────────────────────────────────────
     _trade_stats.loc[
         _trade_stats["is_stale"] & (_trade_stats["Type"] == "Recurring"), "Type"
     ] = "Recurring + Stale"
+    _trade_stats.loc[
+        _trade_stats["is_dup_stale"] & (_trade_stats["Type"] == "Duplicate (same period)"), "Type"
+    ] = "Duplicate + Stale"
 
-    # Aggregate to RecName level
+    # ── Aggregate to RecName level ────────────────────────────────────────────
     _rec_summary = (
         _trade_stats.groupby("RecName")
         .agg(
-            unique_tradeid_count  =("Trade ID",        "count"),
-            recurring_count       =("distinct_periods", lambda x: (x >= 2).sum()),
-            stale_count           =("is_stale",         "sum"),
-            duplicate_count       =("max_in_period",    lambda x: (x >= 2).sum()),
+            unique_tradeid_count =("Trade ID",        "count"),
+            recurring_count      =("distinct_periods", lambda x: (x >= 2).sum()),
+            stale_count          =("is_stale",         "sum"),
+            dup_stale_count      =("is_dup_stale",     "sum"),
+            duplicate_count      =("max_in_period",    lambda x: (x >= 2).sum()),
         )
         .reset_index()
     )
@@ -385,17 +455,52 @@ def _compute_trade_recurring(
         "Unique Tradeid Count",
         "No. of Recurring Tradeids",
         "No. of Stale Breaks",
+        "No. of Dup+Stale Tradeids",
         "No. of Duplicate Tradeids",
     ]
-    _rec_summary["No. of Stale Breaks"]       = _rec_summary["No. of Stale Breaks"].astype(int)
-    _rec_summary["No. of Recurring Tradeids"] = _rec_summary["No. of Recurring Tradeids"].astype(int)
-    _rec_summary["No. of Duplicate Tradeids"] = _rec_summary["No. of Duplicate Tradeids"].astype(int)
+    for _c in ["No. of Stale Breaks", "No. of Recurring Tradeids",
+               "No. of Duplicate Tradeids", "No. of Dup+Stale Tradeids"]:
+        _rec_summary[_c] = _rec_summary[_c].astype(int)
+
+    # ── % Recurring Breaks (break rows, not Trade IDs) for confidence ─────────
+    _total_rows = (
+        _df[_df[rec_col].notna()]
+        .groupby(rec_col).size()
+        .reset_index(name="_total_rows")
+        .rename(columns={rec_col: "RecName"})
+    )
+    _recur_ids = set(
+        _trade_stats.loc[
+            _trade_stats["Type"].isin(["Recurring", "Recurring + Stale"]),
+            "Trade ID"
+        ].astype(str)
+    )
+    _recur_rows = (
+        _df[
+            _df[rec_col].notna() &
+            _df[trade_ref_col].astype(str).isin(_recur_ids)
+        ]
+        .groupby(rec_col).size()
+        .reset_index(name="_recur_rows")
+        .rename(columns={rec_col: "RecName"})
+    )
+    _rec_summary = _rec_summary.merge(_total_rows, on="RecName", how="left")
+    _rec_summary = _rec_summary.merge(_recur_rows, on="RecName", how="left")
+    _rec_summary["_recur_rows"] = _rec_summary["_recur_rows"].fillna(0).astype(int)
+    _rec_summary["% Recurring Breaks"] = (
+        (_rec_summary["_recur_rows"] /
+         _rec_summary["_total_rows"].replace(0, np.nan) * 100)
+        .round(1).fillna(0.0)
+    )
+    _rec_summary = _rec_summary.drop(columns=["_total_rows", "_recur_rows"])
+
     _rec_summary = _rec_summary.sort_values(
         "No. of Recurring Tradeids", ascending=False
     ).reset_index(drop=True)
     _trade_stats = _trade_stats.reset_index(drop=True)
 
     return _trade_stats, _rec_summary
+
 
 
 # ── Parquet cache functions ───────────────────────────────────────────────────
@@ -1497,9 +1602,12 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _rec_summary  = _cached_rec_summary
 
             st.caption(
-                "**Recurring** = same Trade ID in ≥ 2 distinct periods (stale if break value unchanged). "
-                "**Duplicate** = same Trade ID appearing ≥ 2 times within the same period. "
-                "**New** = Trade ID seen in only one period, once."
+                "**Recurring** = same Trade ID in ≥ 2 distinct periods. "
+                "**Recurring + Stale** = recurring with unchanged break value. "
+                "**Duplicate** = same Trade ID ≥ 2× within one period. "
+                "**Duplicate + Stale** = duplicate with identical break value. "
+                "**New** = Trade ID seen once, in one period. "
+                "**% Recurring Breaks** = share of raw break rows belonging to recurring Trade IDs."
             )
 
             _sel_rec_name = None
@@ -1510,13 +1618,31 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                 _gb_rec.configure_default_column(sortable=True, resizable=True, filter=True)
                 _gb_rec.configure_column("RecName", pinned="left", width=200)
                 for _c in ["Unique Tradeid Count", "No. of Recurring Tradeids",
-                           "No. of Stale Breaks", "No. of Duplicate Tradeids"]:
-                    _gb_rec.configure_column(_c, width=160)
+                           "No. of Stale Breaks", "No. of Duplicate Tradeids",
+                           "No. of Dup+Stale Tradeids"]:
+                    if _c in _rec_summary.columns:
+                        _gb_rec.configure_column(_c, width=165)
                 _stale_cs = JsCode("""function(p){
                     var v=parseInt(p.value);
                     if(v>0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
                     return {};}""")
                 _gb_rec.configure_column("No. of Stale Breaks", cellStyle=_stale_cs)
+                _dup_stale_cs = JsCode("""function(p){
+                    var v=parseInt(p.value);
+                    if(v>0) return {'backgroundColor':'#F3E5F5','color':'#5C2D91','fontWeight':'bold'};
+                    return {};}""")
+                if "No. of Dup+Stale Tradeids" in _rec_summary.columns:
+                    _gb_rec.configure_column("No. of Dup+Stale Tradeids", cellStyle=_dup_stale_cs)
+                # % Recurring Breaks — colour coded for confidence
+                _pct_rec_cs = JsCode("""function(p){
+                    var v=parseFloat(p.value);
+                    if(v>=50) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                    if(v>=20) return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20'};}""")
+                if "% Recurring Breaks" in _rec_summary.columns:
+                    _gb_rec.configure_column(
+                        "% Recurring Breaks", cellStyle=_pct_rec_cs, width=160,
+                    )
                 _rec_grid_resp = AgGrid(
                     _rec_summary.reset_index(drop=True),
                     gridOptions=_gb_rec.build(),
@@ -1548,18 +1674,14 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             if _sel_rec_name:
                 st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
                 _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
-                _detail_disp = _detail.rename(columns={
-                    "distinct_periods":  "Periods Seen",
-                    "max_in_period":     "Max in Single Period",
-                    "total_occurrences": "Total Occurrences",
-                })
-                # "Stale" removed — merged into Type as "Recurring + Stale"
-                _show_cols = ["Trade ID", "Type", "Periods Seen",
-                              "Max in Single Period", "Total Occurrences"]
-                if "Avg Break Value" in _detail_disp.columns:
-                    _show_cols.insert(3, "Avg Break Value")
+                # Period Breakdown replaces the three separate numeric columns
+                _show_cols = ["Trade ID", "Type", "Period Breakdown"]
+                if "Avg Break Value" in _detail.columns:
+                    _show_cols.append("Avg Break Value")
+                if "Excess Break (Dup)" in _detail.columns:
+                    _show_cols.append("Excess Break (Dup)")
                 _detail_disp = (
-                    _detail_disp[[c for c in _show_cols if c in _detail_disp.columns]]
+                    _detail[[c for c in _show_cols if c in _detail.columns]]
                     .reset_index(drop=True)
                 )
 
@@ -1570,6 +1692,8 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                             return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
                         if(v==='Recurring')
                             return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                        if(v==='Duplicate + Stale')
+                            return {'backgroundColor':'#F3E5F5','color':'#5C2D91','fontWeight':'bold'};
                         if(v==='Duplicate (same period)')
                             return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
                         if(v==='New')
@@ -1578,17 +1702,19 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                     _gb_det = GridOptionsBuilder.from_dataframe(_detail_disp)
                     _gb_det.configure_default_column(sortable=True, resizable=True, filter=True)
                     _gb_det.configure_column("Trade ID", pinned="left", width=180)
-                    _gb_det.configure_column("Type", cellStyle=_type_cs, width=190)
-                    _gb_det.configure_column("Periods Seen", width=120)
-                    _gb_det.configure_column("Max in Single Period", width=160)
-                    _gb_det.configure_column("Total Occurrences", width=150)
+                    _gb_det.configure_column("Type", cellStyle=_type_cs, width=185)
+                    _gb_det.configure_column(
+                        "Period Breakdown", width=320, wrapText=True, autoHeight=True,
+                    )
                     if "Avg Break Value" in _detail_disp.columns:
                         _gb_det.configure_column("Avg Break Value", width=140)
+                    if "Excess Break (Dup)" in _detail_disp.columns:
+                        _gb_det.configure_column("Excess Break (Dup)", width=155)
                     _gb_det.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
                     AgGrid(
                         _detail_disp,
                         gridOptions=_gb_det.build(),
-                        height=380,
+                        height=400,
                         theme="streamlit",
                         allow_unsafe_jscode=True,
                         key="recname_tradeid_detail_grid",
@@ -1598,42 +1724,49 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                     st.dataframe(_detail_disp, height=350)
 
                 # ── Downloads ────────────────────────────────────────────────
-                _dl_col1, _dl_col2 = st.columns(2)
+                _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
+
+                def _make_dl(ids):
+                    _src = _summary_src[
+                        (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                        (_summary_src[_trade_ref_col].isin(ids))
+                    ].copy()
+                    _src = _src.rename(columns={"_Period_label": "Period"})
+                    return _src[[c for c in _src.columns if not c.startswith("_")]]
 
                 _stale_ids = _detail.loc[
                     _detail["Type"].isin(["Recurring", "Recurring + Stale"]), "Trade ID"
                 ].tolist()
-                _stale_src = _summary_src[
-                    (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
-                    (_summary_src[_trade_ref_col].isin(_stale_ids))
-                ].copy()
-                _stale_dl = _stale_src.rename(columns={"_Period_label": "Period"})
-                _stale_dl = _stale_dl[[c for c in _stale_dl.columns if not c.startswith("_")]]
-
                 with _dl_col1:
                     st.download_button(
-                        f"📥 Download Stale Data — {str(_sel_rec_name)[:30]}",
-                        _stale_dl.to_csv(index=False).encode("utf-8"),
-                        file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                        f"📥 Recurring / Stale — {str(_sel_rec_name)[:25]}",
+                        _make_dl(_stale_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
                         mime="text/csv",
                         key="recname_dl_stale",
                     )
 
                 _new_ids = _detail.loc[_detail["Type"] == "New", "Trade ID"].tolist()
-                _new_src = _summary_src[
-                    (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
-                    (_summary_src[_trade_ref_col].isin(_new_ids))
-                ].copy()
-                _new_dl = _new_src.rename(columns={"_Period_label": "Period"})
-                _new_dl = _new_dl[[c for c in _new_dl.columns if not c.startswith("_")]]
-
                 with _dl_col2:
                     st.download_button(
-                        f"📥 Download New / Non-Reoccurred — {str(_sel_rec_name)[:30]}",
-                        _new_dl.to_csv(index=False).encode("utf-8"),
-                        file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:30]}.csv",
+                        f"📥 New / Non-Reoccurred — {str(_sel_rec_name)[:22]}",
+                        _make_dl(_new_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
                         mime="text/csv",
                         key="recname_dl_new",
+                    )
+
+                _dup_ids = _detail.loc[
+                    _detail["Type"].isin(["Duplicate (same period)", "Duplicate + Stale"]),
+                    "Trade ID",
+                ].tolist()
+                with _dl_col3:
+                    st.download_button(
+                        f"📥 Duplicate Trades — {str(_sel_rec_name)[:25]}",
+                        _make_dl(_dup_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"dup_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_dup",
                     )
 
                 # ── Distribution chart for selected RecName ───────────────────
@@ -1679,6 +1812,7 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                     _type_color_map = {
                         "Recurring + Stale":      "#A84B2F",
                         "Recurring":              "#FFC553",
+                        "Duplicate + Stale":      "#5C2D91",
                         "Duplicate (same period)":"#4F98A3",
                         "New":                    "#01696F",
                         "Unknown":                "#7A7974",
