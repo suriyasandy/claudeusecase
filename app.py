@@ -836,12 +836,26 @@ def compute_rec_thresholds(
         high_t     = float(max(15.0, np.percentile(scores_arr, 75)))
         med_t      = float(max(8.0,  np.percentile(scores_arr, 50)))
 
-        recs_data[str(rec_name)] = {
+        rec_entry = {
             "high_thresh": round(high_t, 2),
             "med_thresh":  round(med_t,  2),
             "n_periods":   n_periods,
             "cv":          round(cv, 4),
         }
+
+        # Per-Rec adaptive GBP threshold — 75th percentile of individual break amounts
+        rec_mask = combined_df[seg_col].astype(str) == str(rec_name)
+        gbp_vals = pd.to_numeric(
+            combined_df.loc[rec_mask, abs_col], errors="coerce"
+        ).abs().dropna()
+        if len(gbp_vals) >= 10:
+            rec_entry["abs_gbp_threshold"] = round(float(np.percentile(gbp_vals, 75)), 0)
+            rec_entry["abs_gbp_p75"]       = round(float(np.percentile(gbp_vals, 75)), 0)
+            rec_entry["abs_gbp_mean"]      = round(float(gbp_vals.mean()), 0)
+        else:
+            rec_entry["abs_gbp_threshold"] = 1_000_000   # fallback to 1M if too few breaks
+
+        recs_data[str(rec_name)] = rec_entry
 
     latest_period = period_order[-1] if period_order else ""
     return {
@@ -929,6 +943,7 @@ def _delete_ml_models() -> None:
 def build_feature_matrix(
     df: pd.DataFrame,
     col_map: dict,
+    rec_thresh_data: dict | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Build the feature matrix X for ML training/inference."""
     rows = pd.DataFrame(index=df.index)
@@ -960,7 +975,18 @@ def build_feature_matrix(
     if abs_col and abs_col in df.columns:
         vals = pd.to_numeric(df[abs_col], errors="coerce").fillna(0.0).abs()
         rows["log_abs_gbp"] = np.log1p(vals)
-        rows["is_high_value"] = (vals > 1_000_000).astype(float)
+        # Adaptive per-Rec GBP threshold (falls back to £1M if no calibration data)
+        _rec_col = col_map.get("Rec Name (as per Rec Cube)")
+        if rec_thresh_data and rec_thresh_data.get("recs") and _rec_col and _rec_col in df.columns:
+            _thresh_map   = {
+                r: float(v.get("abs_gbp_threshold", 1_000_000))
+                for r, v in rec_thresh_data["recs"].items()
+            }
+            _rec_names    = df[_rec_col].fillna("Unknown").astype(str)
+            _rec_threshs  = _rec_names.map(_thresh_map).fillna(1_000_000)
+            rows["is_high_value"] = (vals >= _rec_threshs).astype(float)
+        else:
+            rows["is_high_value"] = (vals > 1_000_000).astype(float)
     else:
         rows["log_abs_gbp"]   = 0.0
         rows["is_high_value"] = 0.0
@@ -1022,7 +1048,7 @@ def train_single_model(
     if mask.sum() < 100:
         return {"error": f"Fewer than 100 labeled rows for '{target_key}'"}
 
-    X_raw, feature_names = build_feature_matrix(df[mask], col_map)
+    X_raw, feature_names = build_feature_matrix(df[mask], col_map, load_rec_thresholds())
     y_raw = df.loc[mask, target_col].astype(str)
 
     # Label encode target
@@ -1215,7 +1241,7 @@ def predict_breaks(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
         return df
 
     out = df.copy()
-    X_raw, feature_names = build_feature_matrix(df, col_map)
+    X_raw, feature_names = build_feature_matrix(df, col_map, load_rec_thresholds())
 
     for target_key, slug in ML_TARGETS.items():
         if slug not in models:
@@ -3059,16 +3085,29 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
             recs_table = []
             for _rn, _rv in rec_thresh_data["recs"].items():
                 _n = _rv.get("n_periods", 0)
+                _gbp_t = _rv.get("abs_gbp_threshold")
                 recs_table.append({
-                    "Rec Name":    _rn,
-                    "High Thresh": _rv.get("high_thresh"),
-                    "Med Thresh":  _rv.get("med_thresh"),
-                    "CV":          _rv.get("cv"),
-                    "N Periods":   _n,
-                    "Source":      "Calibrated" if _n >= 3 else "Global Fallback (< 3 periods)",
+                    "Rec Name":          _rn,
+                    "High Thresh (%)":   _rv.get("high_thresh"),
+                    "Med Thresh (%)":    _rv.get("med_thresh"),
+                    "GBP Threshold (£)": _gbp_t,
+                    "GBP P75 (£)":       _rv.get("abs_gbp_p75"),
+                    "GBP Mean (£)":      _rv.get("abs_gbp_mean"),
+                    "CV":                _rv.get("cv"),
+                    "N Periods":         _n,
+                    "Source":            "Calibrated" if _n >= 3 else "Global Fallback (< 3 periods)",
                 })
             _thresh_tbl = pd.DataFrame(recs_table)
-            st.dataframe(_thresh_tbl, use_container_width=True, hide_index=True)
+            st.dataframe(
+                _thresh_tbl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "GBP Threshold (£)": st.column_config.NumberColumn(format="£%.0f"),
+                    "GBP P75 (£)":       st.column_config.NumberColumn(format="£%.0f"),
+                    "GBP Mean (£)":      st.column_config.NumberColumn(format="£%.0f"),
+                },
+            )
             st.download_button(
                 "📥 Download Threshold Table (CSV)",
                 _thresh_tbl.to_csv(index=False).encode("utf-8"),
@@ -3156,10 +3195,22 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         _issue_display_cols = [c for c in ["Issue Category", "Issue Category 2"]
                                if c in result_df.columns]
 
+    # ── Per-Rec GBP threshold columns ─────────────────────────────────────────
+    _rth = load_rec_thresholds()
+    if _rth and _rth.get("recs"):
+        _gbp_thresh_map = {r: v.get("abs_gbp_threshold") for r, v in _rth["recs"].items()}
+        result_df["Rec GBP Threshold (£)"] = result_df[seg_sel].astype(str).map(_gbp_thresh_map)
+        def _vs_rec_thresh(row):
+            t = row.get("Rec GBP Threshold (£)")
+            if t is None or (isinstance(t, float) and np.isnan(t)):
+                return "—"
+            return "✅ Above" if row["Latest ABS GBP"] >= t else "⬇️ Below (FP Candidate)"
+        result_df["vs Rec Threshold"] = result_df.apply(_vs_rec_thresh, axis=1)
+
     # ── Priority table ────────────────────────────────────────────────────────
     display_cols = (
         [seg_sel] + _jira_display_cols + _issue_display_cols +
-        ["Priority",
+        ["Priority", "Rec GBP Threshold (£)", "vs Rec Threshold",
          "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
          "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
          "Tag for Review"] +
@@ -3448,15 +3499,23 @@ def tab_ml_predictions(
         )
         return
 
-    # Combine current + historical for training
-    combined_frames = [df]
-    if hist_df is not None and len(hist_df) > 0:
-        combined_frames.append(hist_df)
-    combined_df = pd.concat(combined_frames, ignore_index=True)
+    # Training uses historical data only; predictions run on current (df_f)
+    _has_hist = hist_df is not None and len(hist_df) > 0
+    train_df  = hist_df if _has_hist else df   # fall back to current only if no history
+    _hist_periods = (
+        int(hist_df["_Period_label"].nunique()) if _has_hist and "_Period_label" in hist_df.columns else 0
+    )
 
     # ── A: Training Panel ─────────────────────────────────────────────────────
     st.subheader("Model Training")
     meta = _load_ml_meta()
+
+    if not _has_hist:
+        st.warning(
+            "⚠️ No historical data available. Upload at least one previous period file or "
+            "wait for the cache to accumulate a second period. "
+            "Training will use the current upload as a fallback — accuracy will be lower."
+        )
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -3464,7 +3523,8 @@ def tab_ml_predictions(
     with m2:
         kpi_card("Trained On (rows)", f"{meta['n_rows']:,}" if meta else "—")
     with m3:
-        kpi_card("Last Trained", meta["trained_at"][:10] if meta else "—")
+        kpi_card("Historical Periods", str(_hist_periods) if _has_hist else "None",
+                 warn=(not _has_hist))
     with m4:
         if meta and meta.get("metrics"):
             acc_vals = [v["accuracy"] for v in meta["metrics"].values() if v.get("accuracy")]
@@ -3486,16 +3546,13 @@ def tab_ml_predictions(
             st.dataframe(pd.DataFrame(acc_rows), hide_index=True, use_container_width=True)
 
     with st.expander("Advanced Training Options", expanded=False):
-        _incl_hist = st.checkbox("Include historical data in training", value=True, key="_ml_incl_hist")
         _retrain_single = st.selectbox(
             "Retrain single target only (or train all)",
             ["All"] + list(ML_TARGETS.keys()),
             key="_ml_retrain_sel",
         )
 
-    train_df = combined_df if st.session_state.get("_ml_incl_hist", True) else df
-
-    if st.button("🚀 Train Models on Current + Historical Data", key="_ml_train_btn", type="primary"):
+    if st.button("🚀 Train Models on Historical Data", key="_ml_train_btn", type="primary"):
         _prog = st.progress(0.0, text="Training…")
         def _cb(p):
             _prog.progress(min(p, 1.0), text=f"Training… {int(p*100)}%")
@@ -3627,19 +3684,33 @@ def tab_ml_predictions(
                 _oe_m  = models_loaded[_slug]["oe_meta"]
                 _, _col_meta = _oe_m
                 _feat_names  = _col_meta["cat_cols"] + _col_meta["num_cols"]
-                _importances = _model.feature_importances_
-                if len(_feat_names) == len(_importances):
-                    _fi_df = pd.DataFrame({
-                        "Feature":    _feat_names,
-                        "Importance": _importances,
-                    }).sort_values("Importance", ascending=True).tail(20)
-                    fig_fi = px.bar(
-                        _fi_df, x="Importance", y="Feature", orientation="h",
-                        color_discrete_sequence=[PRIMARY],
+                if not hasattr(_model, "feature_importances_"):
+                    st.info(
+                        "Feature importance requires scikit-learn ≥ 1.0. "
+                        "Upgrade: `pip install -U scikit-learn`"
                     )
-                    fig_fi = chart_layout(fig_fi, f"Top Feature Importance — {_tgt_sel}",
-                                         "Importance (gain)", "Feature", height=500)
-                    st.plotly_chart(fig_fi, use_container_width=True)
+                else:
+                    _importances = _model.feature_importances_
+                    # Fallback: if lengths don't match, use stored full feature_names list
+                    if len(_feat_names) != len(_importances):
+                        _feat_names = _col_meta.get("feature_names", _feat_names)
+                    if len(_feat_names) == len(_importances):
+                        _fi_df = pd.DataFrame({
+                            "Feature":    _feat_names,
+                            "Importance": _importances,
+                        }).sort_values("Importance", ascending=True).tail(20)
+                        fig_fi = px.bar(
+                            _fi_df, x="Importance", y="Feature", orientation="h",
+                            color_discrete_sequence=[PRIMARY],
+                        )
+                        fig_fi = chart_layout(fig_fi, f"Top Feature Importance — {_tgt_sel}",
+                                             "Importance (gain)", "Feature", height=500)
+                        st.plotly_chart(fig_fi, use_container_width=True)
+                    else:
+                        st.warning(
+                            f"Feature count mismatch: {len(_feat_names)} names vs "
+                            f"{len(_importances)} importances. Retrain the model to fix."
+                        )
 
     with pat2:
         issue_col  = col_map.get("ISSUE CATEGORY")
