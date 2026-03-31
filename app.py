@@ -67,6 +67,19 @@ try:
 except ImportError:
     HAS_JIRA = False
 
+try:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import joblib
+    import scipy.sparse as _sp
+    HAS_ML = True
+except ImportError:
+    HAS_ML = False
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Accounting Control AI Platform",
@@ -83,6 +96,40 @@ BG_LIGHT     = "#F7F7F5"
 WARN         = "#A84B2F"
 BUCKET_ORDER = ["0-15","16-30","31-60","61-90","91-180","181-365","365+","Unknown"]
 MAX_JS_INT   = 2 ** 53
+
+# ── ML / Threshold constants ──────────────────────────────────────────────────
+ML_TARGETS = {
+    "ISSUE CATEGORY":     "issue_category",
+    "ISSUE CATEGORY2":    "issue_category2",
+    "SYSTEM TO BE FIXED": "system_to_be_fixed",
+}
+ML_TARGET_COL_KEYS = {
+    "issue_category":     "ISSUE CATEGORY",
+    "issue_category2":    "ISSUE CATEGORY2",
+    "system_to_be_fixed": "SYSTEM TO BE FIXED",
+}
+ML_FEATURE_CAT_KEYS = [
+    "Rec Name (as per Rec Cube)", "Team", "Entity", "Type of break",
+    "Asset Class", "Account Group", "Products Reconciled", "TRADE CCY",
+    "True/Systemic Breaks", "Cash/Non Cash", "ABS GBP(Greater than 1mn)", "Bucket",
+]
+ML_FEATURE_NUM_KEYS = ["ABS GBP", "BREAK AMOUNT GBP", "Age Days"]
+HGBT_PARAMS = {
+    "max_iter": 300,
+    "learning_rate": 0.05,
+    "min_samples_leaf": 50,
+    "class_weight": "balanced",
+    "random_state": 42,
+    "early_stopping": True,
+    "n_iter_no_change": 15,
+}
+CONFIDENCE_THRESHOLDS = {"High": 0.75, "Medium": 0.50}
+JIRA_SIM_THRESHOLDS   = {"High": 0.70, "Medium": 0.45}
+ACTION_RECOMMENDATIONS = {
+    "High":   "Auto-route to predicted category. Flag for confirmation only.",
+    "Medium": "Suggest predicted category. Analyst should verify before routing.",
+    "Low":    "Manual review required. Insufficient historical pattern.",
+}
 
 st.markdown(f"""
 <style>
@@ -691,6 +738,525 @@ def drop_blank_trailing(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(how="all")
 
 
+# ── Part A: Per-Rec Adaptive Threshold helpers ────────────────────────────────
+
+def rec_thresh_path() -> str:
+    return os.path.join(_cache_dir(), "rec_thresholds.json")
+
+
+def load_rec_thresholds() -> dict | None:
+    path = rec_thresh_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_rec_thresholds(data: dict) -> None:
+    try:
+        with open(rec_thresh_path(), "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def compute_rec_thresholds(
+    combined_df: pd.DataFrame,
+    col_map: dict,
+    seg_col: str,
+    cnt_weight: float,
+    abs_col: str,
+) -> dict:
+    """Compute per-Rec volatility-aware High/Medium thresholds from historical data.
+
+    Uses the same composite score formula as tab_fp_thresholding():
+      composite = (1 - w) * abs_gbp_dev_pct + w * count_dev_pct
+    where dev_pct is the per-period deviation from the Rec's own mean.
+    High  = 75th percentile of that Rec's historical scores (min 15)
+    Medium = 50th percentile / median                         (min  8)
+    """
+    if "_Period_label" not in combined_df.columns or seg_col not in combined_df.columns:
+        return {}
+
+    w = cnt_weight / 100.0
+    period_order = sorted(combined_df["_Period_label"].dropna().unique().tolist())
+    if len(period_order) < 2:
+        return {}
+
+    # ABS GBP per period per seg
+    grp_amt = (
+        combined_df.groupby([seg_col, "_Period_label"])[abs_col]
+        .sum()
+        .reset_index()
+    )
+    pivot_amt = grp_amt.pivot_table(
+        index=seg_col, columns="_Period_label", values=abs_col, fill_value=0.0
+    ).reset_index()
+
+    # Count per period per seg
+    grp_cnt = (
+        combined_df.groupby([seg_col, "_Period_label"])
+        .size()
+        .reset_index(name="_cnt")
+    )
+    pivot_cnt = grp_cnt.pivot_table(
+        index=seg_col, columns="_Period_label", values="_cnt", fill_value=0
+    ).reset_index()
+
+    recs_data = {}
+    for idx, row in pivot_amt.iterrows():
+        rec_name = row[seg_col]
+        amt_vals = np.array([float(row.get(p, 0.0)) for p in period_order])
+        cnt_row  = pivot_cnt[pivot_cnt[seg_col] == rec_name]
+        if len(cnt_row) == 0:
+            cnt_vals = np.zeros(len(period_order))
+        else:
+            cnt_vals = np.array([float(cnt_row.iloc[0].get(p, 0)) for p in period_order])
+
+        n_periods = len(period_order)
+        scores = []
+        for i in range(1, n_periods):
+            hist_amt  = float(np.mean(amt_vals[:i]))
+            hist_cnt  = float(np.mean(cnt_vals[:i]))
+            dev_amt   = (amt_vals[i] - hist_amt)  / max(hist_amt, 1.0) * 100.0
+            dev_cnt   = (cnt_vals[i] - hist_cnt)  / max(hist_cnt, 1.0) * 100.0
+            composite = (1.0 - w) * dev_amt + w * dev_cnt
+            scores.append(composite)
+
+        if len(scores) < 1:
+            continue
+
+        scores_arr = np.array(scores)
+        hist_mean  = float(np.mean(scores_arr))
+        hist_std   = float(np.std(scores_arr))
+        cv         = hist_std / max(abs(hist_mean), 1.0)
+        high_t     = float(max(15.0, np.percentile(scores_arr, 75)))
+        med_t      = float(max(8.0,  np.percentile(scores_arr, 50)))
+
+        recs_data[str(rec_name)] = {
+            "high_thresh": round(high_t, 2),
+            "med_thresh":  round(med_t,  2),
+            "n_periods":   n_periods,
+            "cv":          round(cv, 4),
+        }
+
+    latest_period = period_order[-1] if period_order else ""
+    return {
+        "calibrated_at":  latest_period,
+        "n_periods_used": len(period_order),
+        "segment_col":    seg_col,
+        "recs":           recs_data,
+    }
+
+
+def apply_rec_thresholds(
+    pivot_df: pd.DataFrame,
+    composite_score: np.ndarray,
+    seg_col: str,
+    rec_thresh_data: dict | None,
+    global_high: float,
+    global_med:  float,
+) -> pd.Series:
+    """Assign priority per row using per-Rec thresholds where available."""
+    min_periods = 3
+    priorities = []
+    recs_lookup = (rec_thresh_data or {}).get("recs", {})
+    for i, (_, row) in enumerate(pivot_df.iterrows()):
+        rec_name = str(row.get(seg_col, ""))
+        rec_info = recs_lookup.get(rec_name, {})
+        if rec_info and rec_info.get("n_periods", 0) >= min_periods:
+            ht = rec_info["high_thresh"]
+            mt = rec_info["med_thresh"]
+        else:
+            ht = global_high
+            mt = global_med
+        score = float(composite_score[i])
+        if score >= ht:
+            priorities.append("🔴 High")
+        elif score >= mt:
+            priorities.append("🟡 Medium")
+        else:
+            priorities.append("🟢 Low / FP Candidate")
+    return pd.Series(priorities, index=pivot_df.index)
+
+
+# ── Part B: ML Prediction helpers ─────────────────────────────────────────────
+
+def ml_cache_dir() -> str:
+    d = os.path.join(_cache_dir(), "ml_models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def ml_model_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_model.joblib")
+
+
+def ml_encoder_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_encoder.joblib")
+
+
+def ml_ord_encoder_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_ord_encoder.joblib")
+
+
+def ml_meta_path() -> str:
+    return os.path.join(ml_cache_dir(), "ml_training_meta.json")
+
+
+def _load_ml_meta() -> dict | None:
+    path = ml_meta_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _delete_ml_models() -> None:
+    import shutil
+    try:
+        shutil.rmtree(ml_cache_dir(), ignore_errors=True)
+    except Exception:
+        pass
+
+
+def build_feature_matrix(
+    df: pd.DataFrame,
+    col_map: dict,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build the feature matrix X for ML training/inference."""
+    rows = pd.DataFrame(index=df.index)
+
+    # Categorical features
+    cat_cols_present = []
+    for key in ML_FEATURE_CAT_KEYS:
+        col = col_map.get(key)
+        if col and col in df.columns:
+            rows[key] = df[col].fillna("Unknown").astype(str)
+            cat_cols_present.append(key)
+        else:
+            rows[key] = "Unknown"
+            cat_cols_present.append(key)
+
+    # Bucket ordinal
+    bucket_key = "Bucket"
+    if bucket_key in rows.columns:
+        bmap = {b: i for i, b in enumerate(BUCKET_ORDER)}
+        rows["age_bucket_int"] = rows[bucket_key].map(bmap).fillna(len(BUCKET_ORDER) - 1).astype(float)
+    else:
+        rows["age_bucket_int"] = 0.0
+
+    # Rec+Team combo
+    rows["rec_team_combo"] = rows.get("Rec Name (as per Rec Cube)", "Unknown").astype(str) + "|" + rows.get("Team", "Unknown").astype(str)
+
+    # Numerical features
+    abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    if abs_col and abs_col in df.columns:
+        vals = pd.to_numeric(df[abs_col], errors="coerce").fillna(0.0).abs()
+        rows["log_abs_gbp"] = np.log1p(vals)
+        rows["is_high_value"] = (vals > 1_000_000).astype(float)
+    else:
+        rows["log_abs_gbp"]   = 0.0
+        rows["is_high_value"] = 0.0
+
+    brk_col = col_map.get("BREAK AMOUNT GBP")
+    if brk_col and brk_col in df.columns and brk_col != abs_col:
+        rows["log_break_gbp"] = np.log1p(pd.to_numeric(df[brk_col], errors="coerce").fillna(0.0).abs())
+    else:
+        rows["log_break_gbp"] = rows["log_abs_gbp"]
+
+    age_col = col_map.get("Age Days")
+    if age_col and age_col in df.columns:
+        age = pd.to_numeric(df[age_col], errors="coerce").fillna(0.0).clip(0, 3650)
+        rows["age_norm"] = age / 365.0
+    else:
+        rows["age_norm"] = 0.0
+
+    # Cyclical month encoding from _Period_label (YYYYMM int)
+    if "_Period_label" in df.columns:
+        periods = pd.to_numeric(df["_Period_label"], errors="coerce").fillna(0)
+        month = (periods % 100).clip(1, 12)
+        rows["month_sin"] = np.sin(2 * np.pi * month / 12.0)
+        rows["month_cos"] = np.cos(2 * np.pi * month / 12.0)
+    else:
+        rows["month_sin"] = 0.0
+        rows["month_cos"] = 0.0
+
+    # Identify categorical feature column names in X
+    feature_names = list(rows.columns)
+    return rows, feature_names
+
+
+def _get_cat_feature_indices(feature_names: list[str]) -> list[int]:
+    """Return indices of categorical (string) features for HistGBT."""
+    cat_set = set(ML_FEATURE_CAT_KEYS) | {"rec_team_combo"}
+    return [i for i, n in enumerate(feature_names) if n in cat_set]
+
+
+def train_single_model(
+    df: pd.DataFrame,
+    col_map: dict,
+    target_key: str,
+) -> dict:
+    """Train one HistGradientBoostingClassifier for the given target_key."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    slug       = ML_TARGETS[target_key]
+    target_col = col_map.get(target_key)
+    if not target_col or target_col not in df.columns:
+        return {"error": f"Column '{target_key}' not found in data"}
+
+    # Non-null mask
+    mask = (
+        df[target_col].notna()
+        & (df[target_col].astype(str).str.strip() != "")
+        & (~df[target_col].astype(str).isin(["nan", "None", "N/A", "-"]))
+    )
+    if mask.sum() < 100:
+        return {"error": f"Fewer than 100 labeled rows for '{target_key}'"}
+
+    X_raw, feature_names = build_feature_matrix(df[mask], col_map)
+    y_raw = df.loc[mask, target_col].astype(str)
+
+    # Label encode target
+    le = LabelEncoder()
+    y  = le.fit_transform(y_raw)
+
+    # Ordinal encode categoricals (required by HistGBT)
+    cat_indices = _get_cat_feature_indices(feature_names)
+    cat_cols    = [feature_names[i] for i in cat_indices]
+    num_cols    = [c for c in feature_names if c not in cat_cols]
+
+    oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    X_cat = oe.fit_transform(X_raw[cat_cols].astype(str)) if cat_cols else np.zeros((len(X_raw), 0))
+    X_num = X_raw[num_cols].astype(float).values if num_cols else np.zeros((len(X_raw), 0))
+    X = np.hstack([X_cat, X_num])
+    cat_feat_indices = list(range(len(cat_cols)))  # categorical cols are first after hstack
+
+    # Store column order metadata alongside model
+    col_meta = {"cat_cols": cat_cols, "num_cols": num_cols, "feature_names": feature_names}
+
+    # Stratified split
+    try:
+        X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    except ValueError:
+        X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    params = dict(HGBT_PARAMS)
+    if len(le.classes_) > 2:
+        params.pop("class_weight", None)  # multiclass doesn't support class_weight in HGBT
+
+    model = HistGradientBoostingClassifier(
+        **params,
+        categorical_features=cat_feat_indices if cat_feat_indices else None,
+    )
+    model.fit(X_tr, y_tr)
+
+    acc = float(accuracy_score(y_val, model.predict(X_val)))
+
+    # Persist
+    joblib.dump(model,      ml_model_path(slug))
+    joblib.dump(le,         ml_encoder_path(slug))
+    joblib.dump((oe, col_meta), ml_ord_encoder_path(slug))
+
+    return {
+        "accuracy":  acc,
+        "n_train":   int(mask.sum()),
+        "n_classes": int(len(le.classes_)),
+    }
+
+
+def build_jira_similarity_index(df: pd.DataFrame, col_map: dict) -> dict:
+    """Build TF-IDF index on JIRA DESC for Jira reference similarity matching."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    jira_ref_col  = col_map.get("Jira Reference")
+    jira_desc_col = col_map.get("Jira Desc")
+    if not jira_ref_col or jira_desc_col is None:
+        return {"error": "Jira Reference or Jira Desc column not found"}
+    if jira_ref_col not in df.columns or jira_desc_col not in df.columns:
+        return {"error": "Jira columns absent from dataframe"}
+
+    sub = df[[jira_ref_col, jira_desc_col]].dropna(subset=[jira_ref_col, jira_desc_col])
+    sub = sub[sub[jira_desc_col].astype(str).str.strip() != ""]
+    if len(sub) < 10:
+        return {"error": "Fewer than 10 rows with both Jira ref and description"}
+
+    # Most frequent description per Jira ref
+    ref_desc = (
+        sub.groupby(jira_ref_col)[jira_desc_col]
+        .agg(lambda x: x.value_counts().index[0])
+        .reset_index()
+    )
+    corpus     = ref_desc[jira_desc_col].astype(str).tolist()
+    ref_lookup = ref_desc[jira_ref_col].astype(str).tolist()
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2), max_features=10_000, sublinear_tf=True, min_df=2
+    )
+    corpus_matrix = vectorizer.fit_transform(corpus)
+
+    joblib.dump(vectorizer,    os.path.join(ml_cache_dir(), "tfidf_vectorizer.joblib"))
+    joblib.dump(corpus_matrix, os.path.join(ml_cache_dir(), "tfidf_corpus_matrix.joblib"))
+    joblib.dump(ref_lookup,    os.path.join(ml_cache_dir(), "jira_ref_lookup.joblib"))
+
+    return {"n_jira_refs": len(ref_lookup)}
+
+
+def train_all_models(
+    df: pd.DataFrame,
+    col_map: dict,
+    progress_cb=None,
+) -> dict:
+    """Train all 3 classifiers + Jira similarity index. Returns metrics dict."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    results = {}
+    steps   = list(ML_TARGETS.keys()) + ["jira_index"]
+    for i, target_key in enumerate(ML_TARGETS.keys()):
+        res = train_single_model(df, col_map, target_key)
+        results[target_key] = res
+        if progress_cb:
+            progress_cb((i + 1) / len(steps))
+
+    jira_res = build_jira_similarity_index(df, col_map)
+    results["jira_index"] = jira_res
+    if progress_cb:
+        progress_cb(1.0)
+
+    # Save metadata
+    import datetime as _dt
+    meta = {
+        "trained_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "n_rows":     int(len(df)),
+        "metrics": {
+            k: {"accuracy": v.get("accuracy"), "n_train": v.get("n_train")}
+            for k, v in results.items() if isinstance(v, dict) and "accuracy" in v
+        },
+    }
+    try:
+        with open(ml_meta_path(), "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+    return results
+
+
+def load_models() -> dict:
+    """Load all saved ML models. Returns {} if none trained yet."""
+    if not HAS_ML:
+        return {}
+    models = {}
+    for target_key, slug in ML_TARGETS.items():
+        mp = ml_model_path(slug)
+        ep = ml_encoder_path(slug)
+        op = ml_ord_encoder_path(slug)
+        if os.path.exists(mp) and os.path.exists(ep) and os.path.exists(op):
+            try:
+                models[slug] = {
+                    "model":       joblib.load(mp),
+                    "le":          joblib.load(ep),
+                    "oe_meta":     joblib.load(op),
+                }
+            except Exception:
+                pass
+    # Jira TF-IDF
+    vp  = os.path.join(ml_cache_dir(), "tfidf_vectorizer.joblib")
+    cmp = os.path.join(ml_cache_dir(), "tfidf_corpus_matrix.joblib")
+    rlp = os.path.join(ml_cache_dir(), "jira_ref_lookup.joblib")
+    if os.path.exists(vp) and os.path.exists(cmp) and os.path.exists(rlp):
+        try:
+            models["jira"] = {
+                "vectorizer":    joblib.load(vp),
+                "corpus_matrix": joblib.load(cmp),
+                "ref_lookup":    joblib.load(rlp),
+            }
+        except Exception:
+            pass
+    return models
+
+
+def confidence_tier(score: float, mode: str = "classifier") -> str:
+    thresholds = JIRA_SIM_THRESHOLDS if mode == "jira" else CONFIDENCE_THRESHOLDS
+    if score >= thresholds["High"]:
+        return "High"
+    if score >= thresholds["Medium"]:
+        return "Medium"
+    return "Low"
+
+
+def _encode_for_inference(X_raw: pd.DataFrame, oe_meta: tuple) -> np.ndarray:
+    """Apply saved OrdinalEncoder + column ordering for inference."""
+    oe, col_meta = oe_meta
+    cat_cols = col_meta["cat_cols"]
+    num_cols = col_meta["num_cols"]
+    X_cat = oe.transform(X_raw[cat_cols].astype(str)) if cat_cols else np.zeros((len(X_raw), 0))
+    X_num = X_raw[num_cols].astype(float).values if num_cols else np.zeros((len(X_raw), 0))
+    return np.hstack([X_cat, X_num])
+
+
+def predict_breaks(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
+    """Return df enriched with _pred_* and _conf_* columns for each target."""
+    if not HAS_ML:
+        return df
+
+    models = load_models()
+    if not models:
+        return df
+
+    out = df.copy()
+    X_raw, feature_names = build_feature_matrix(df, col_map)
+
+    for target_key, slug in ML_TARGETS.items():
+        if slug not in models:
+            continue
+        m    = models[slug]["model"]
+        le   = models[slug]["le"]
+        oe_m = models[slug]["oe_meta"]
+        try:
+            X = _encode_for_inference(X_raw, oe_m)
+            proba    = m.predict_proba(X)
+            pred_idx = proba.argmax(axis=1)
+            conf     = proba[np.arange(len(proba)), pred_idx]
+            pred_lbl = le.inverse_transform(pred_idx)
+            out[f"_pred_{slug}"]      = pred_lbl
+            out[f"_conf_{slug}"]      = np.round(conf, 4)
+            out[f"_conf_tier_{slug}"] = [confidence_tier(c) for c in conf]
+        except Exception:
+            pass
+
+    # Jira reference via TF-IDF similarity
+    if "jira" in models:
+        jira_desc_col = col_map.get("Jira Desc")
+        if jira_desc_col and jira_desc_col in df.columns:
+            vec    = models["jira"]["vectorizer"]
+            corpus = models["jira"]["corpus_matrix"]
+            refs   = models["jira"]["ref_lookup"]
+            descs  = df[jira_desc_col].fillna("").astype(str).tolist()
+            try:
+                q_mat    = vec.transform(descs)
+                sim_mat  = cosine_similarity(q_mat, corpus)
+                top_idx  = sim_mat.argmax(axis=1)
+                top_conf = sim_mat[np.arange(len(sim_mat)), top_idx]
+                out["_pred_jira_ref"]       = [refs[i] for i in top_idx]
+                out["_conf_jira_ref"]       = np.round(top_conf, 4)
+                out["_conf_tier_jira_ref"]  = [confidence_tier(c, "jira") for c in top_conf]
+            except Exception:
+                pass
+
+    return out
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 def run_pipeline(raw_bytes: bytes) -> dict:
@@ -840,7 +1406,9 @@ def build_sidebar_filters(df: pd.DataFrame, col_map: dict) -> dict:
 
 def _reset_filters():
     for k in ["_filters_applied", "_fp_seg_keys", "_fp_seg_cols",
-              "_drill_rec", "_overflow"]:
+              "_drill_rec", "_overflow",
+              "_ml_predictions_df", "_rec_thresh_calibrated",
+              "_use_rec_thresh"]:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -848,12 +1416,16 @@ def _reset_filters():
 def clear_all_cache() -> int:
     """Delete all cached Parquet files and the period index from disk,
     then wipe all session state keys. Returns number of files deleted."""
+    import shutil
     cache = _cache_dir()
     deleted = 0
     for fname in os.listdir(cache):
         fpath = os.path.join(cache, fname)
         try:
-            os.remove(fpath)
+            if os.path.isdir(fpath):
+                shutil.rmtree(fpath, ignore_errors=True)
+            else:
+                os.remove(fpath)
             deleted += 1
         except Exception:
             pass
@@ -2439,11 +3011,78 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     w_cnt           = cnt_weight / 100.0
     composite_score = (1.0 - w_cnt) * dev_pct + w_cnt * dev_pct_cnt
 
-    conditions = [
-        composite_score >= high_thresh,
-        composite_score >= med_thresh,
-    ]
-    pivot["Priority"] = np.select(conditions, ["🔴 High", "🟡 Medium"], default="🟢 Low / FP Candidate")
+    # ── Adaptive Threshold Calibration Panel ─────────────────────────────────
+    with st.expander("⚙️ Adaptive Threshold Calibration", expanded=False):
+        rec_thresh_data = load_rec_thresholds()
+        _cal_col1, _cal_col2, _cal_col3, _cal_col4 = st.columns(4)
+        with _cal_col1:
+            _is_cal = rec_thresh_data is not None and "recs" in rec_thresh_data
+            kpi_card("Calibrated?", "Yes" if _is_cal else "No",
+                     warn=(not _is_cal))
+        with _cal_col2:
+            kpi_card("Last Calibrated Period",
+                     rec_thresh_data.get("calibrated_at", "—") if rec_thresh_data else "—")
+        with _cal_col3:
+            n_cal = len(rec_thresh_data.get("recs", {})) if rec_thresh_data else 0
+            kpi_card("Recs Calibrated", str(n_cal))
+        with _cal_col4:
+            kpi_card("Segment Used",
+                     rec_thresh_data.get("segment_col", "—") if rec_thresh_data else "—")
+
+        if st.button("Calibrate Thresholds from Historical Data",
+                     key="_thresh_calibrate_btn",
+                     help="Compute per-Rec High/Medium thresholds from all available historical periods"):
+            with st.spinner("Calibrating per-Rec thresholds…"):
+                cal_result = compute_rec_thresholds(
+                    combined, col_map, seg_sel, cnt_weight, abs_col
+                )
+            if cal_result.get("recs"):
+                save_rec_thresholds(cal_result)
+                st.session_state["_rec_thresh_calibrated"] = True
+                st.success(
+                    f"✅ Calibrated thresholds for {len(cal_result['recs'])} Recs "
+                    f"using {cal_result['n_periods_used']} periods."
+                )
+                st.rerun()
+            else:
+                st.warning("Not enough historical periods to calibrate (need ≥ 2).")
+
+        _use_rec = st.checkbox(
+            "Use per-Rec adaptive thresholds (recommended)",
+            value=True,
+            key="_use_rec_thresh",
+            help="When enabled, each Rec uses its own volatility-calibrated threshold. "
+                 "Recs with < 3 historical periods fall back to the global sliders above."
+        )
+
+        if rec_thresh_data and rec_thresh_data.get("recs"):
+            recs_table = []
+            for _rn, _rv in rec_thresh_data["recs"].items():
+                _n = _rv.get("n_periods", 0)
+                recs_table.append({
+                    "Rec Name":    _rn,
+                    "High Thresh": _rv.get("high_thresh"),
+                    "Med Thresh":  _rv.get("med_thresh"),
+                    "CV":          _rv.get("cv"),
+                    "N Periods":   _n,
+                    "Source":      "Calibrated" if _n >= 3 else "Global Fallback (< 3 periods)",
+                })
+            _thresh_tbl = pd.DataFrame(recs_table)
+            st.dataframe(_thresh_tbl, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Download Threshold Table (CSV)",
+                _thresh_tbl.to_csv(index=False).encode("utf-8"),
+                file_name="rec_thresholds.csv",
+                mime="text/csv",
+                key="_dl_thresh_csv",
+            )
+
+    # Apply per-Rec or global thresholds
+    _use_adaptive = st.session_state.get("_use_rec_thresh", True)
+    _loaded_thresh = load_rec_thresholds() if _use_adaptive else None
+    pivot["Priority"] = apply_rec_thresholds(
+        pivot, composite_score, seg_sel, _loaded_thresh, high_thresh, med_thresh
+    )
     pivot["Tag for Review"] = pivot["Priority"] == "🔴 High"
 
     # Per-period display columns
@@ -2784,6 +3423,361 @@ def tab_period_comparison(df_f: pd.DataFrame, hist_df, col_map: dict) -> None:
     )
 
 
+# ── Tab: ML Predictions ───────────────────────────────────────────────────────
+
+def tab_ml_predictions(
+    df: pd.DataFrame,
+    df_f: pd.DataFrame,
+    col_map: dict,
+    hist_df,
+) -> None:
+    st.markdown("## 🤖 ML Break Outcome Predictions")
+    st.markdown(
+        '<div class="banner-info">🤖 Train models on your labeled historical breaks, '
+        'then predict <b>Issue Category</b>, <b>Issue Category 2</b>, '
+        '<b>System to be Fixed</b>, and <b>Jira Reference</b> for new unlabeled breaks. '
+        'Confidence scores help route each break automatically or flag it for manual review.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not HAS_ML:
+        st.warning(
+            "ML dependencies not installed. Run:\n\n"
+            "```\npip install scikit-learn joblib\n```\n\n"
+            "then restart the app."
+        )
+        return
+
+    # Combine current + historical for training
+    combined_frames = [df]
+    if hist_df is not None and len(hist_df) > 0:
+        combined_frames.append(hist_df)
+    combined_df = pd.concat(combined_frames, ignore_index=True)
+
+    # ── A: Training Panel ─────────────────────────────────────────────────────
+    st.subheader("Model Training")
+    meta = _load_ml_meta()
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        kpi_card("Models Trained?", "Yes" if meta else "No", warn=(meta is None))
+    with m2:
+        kpi_card("Trained On (rows)", f"{meta['n_rows']:,}" if meta else "—")
+    with m3:
+        kpi_card("Last Trained", meta["trained_at"][:10] if meta else "—")
+    with m4:
+        if meta and meta.get("metrics"):
+            acc_vals = [v["accuracy"] for v in meta["metrics"].values() if v.get("accuracy")]
+            avg_acc  = sum(acc_vals) / len(acc_vals) if acc_vals else 0.0
+            kpi_card("Avg Model Accuracy", f"{avg_acc:.1%}")
+        else:
+            kpi_card("Avg Model Accuracy", "—")
+
+    if meta and meta.get("metrics"):
+        acc_rows = []
+        for tgt, vals in meta["metrics"].items():
+            if vals.get("accuracy") is not None:
+                acc_rows.append({
+                    "Target":    tgt,
+                    "Accuracy":  f"{vals['accuracy']:.1%}",
+                    "Train Rows": f"{vals.get('n_train', 0):,}",
+                })
+        if acc_rows:
+            st.dataframe(pd.DataFrame(acc_rows), hide_index=True, use_container_width=True)
+
+    with st.expander("Advanced Training Options", expanded=False):
+        _incl_hist = st.checkbox("Include historical data in training", value=True, key="_ml_incl_hist")
+        _retrain_single = st.selectbox(
+            "Retrain single target only (or train all)",
+            ["All"] + list(ML_TARGETS.keys()),
+            key="_ml_retrain_sel",
+        )
+
+    train_df = combined_df if st.session_state.get("_ml_incl_hist", True) else df
+
+    if st.button("🚀 Train Models on Current + Historical Data", key="_ml_train_btn", type="primary"):
+        _prog = st.progress(0.0, text="Training…")
+        def _cb(p):
+            _prog.progress(min(p, 1.0), text=f"Training… {int(p*100)}%")
+
+        with st.spinner("Training ML models (may take 1–3 minutes for large datasets)…"):
+            _sel = st.session_state.get("_ml_retrain_sel", "All")
+            if _sel == "All":
+                train_results = train_all_models(train_df, col_map, progress_cb=_cb)
+            else:
+                train_results = {_sel: train_single_model(train_df, col_map, _sel)}
+                _cb(1.0)
+
+        _prog.empty()
+        errors = {k: v for k, v in train_results.items()
+                  if isinstance(v, dict) and "error" in v}
+        if errors:
+            for k, v in errors.items():
+                st.warning(f"{k}: {v['error']}")
+        successes = {k: v for k, v in train_results.items()
+                     if isinstance(v, dict) and "accuracy" in v}
+        if successes:
+            st.success(
+                f"✅ Trained {len(successes)} model(s). "
+                + "  |  ".join(f"{k}: {v['accuracy']:.1%}" for k, v in successes.items())
+            )
+        st.rerun()
+
+    st.divider()
+
+    # ── B: Predictions Panel ──────────────────────────────────────────────────
+    st.subheader("Predictions for Current Upload")
+
+    if not meta:
+        st.info("Train models first using the panel above.")
+    else:
+        if st.button("▶️ Run Predictions on Current Data", key="_ml_predict_btn"):
+            with st.spinner("Running predictions…"):
+                pred_df = predict_breaks(df_f, col_map)
+            st.session_state["_ml_predictions_df"] = pred_df
+            st.success(f"Predictions complete for {len(pred_df):,} rows.")
+            st.rerun()
+
+        pred_df = st.session_state.get("_ml_predictions_df")
+        if pred_df is not None and len(pred_df) > 0:
+            # Summary KPIs
+            _conf_cols = [c for c in pred_df.columns if c.startswith("_conf_tier_")]
+            if _conf_cols:
+                _tier_counts = {t: 0 for t in ["High", "Medium", "Low"]}
+                for cc in _conf_cols:
+                    for t in _tier_counts:
+                        _tier_counts[t] += int((pred_df[cc] == t).sum())
+                _total_cells = len(pred_df) * len(_conf_cols)
+                pk1, pk2, pk3, pk4 = st.columns(4)
+                with pk1: kpi_card("Rows Predicted", f"{len(pred_df):,}")
+                with pk2: kpi_card("High Confidence", f"{_tier_counts['High']:,}", f"{_tier_counts['High']/_total_cells:.0%} of all predictions")
+                with pk3: kpi_card("Medium Confidence", f"{_tier_counts['Medium']:,}", f"{_tier_counts['Medium']/_total_cells:.0%} of all predictions", warn=True)
+                with pk4: kpi_card("Low Confidence", f"{_tier_counts['Low']:,}", f"{_tier_counts['Low']/_total_cells:.0%} — manual review needed", warn=(_tier_counts['Low'] > _total_cells * 0.3))
+
+                # Confidence tier breakdown chart
+                tier_rows = []
+                for cc in _conf_cols:
+                    lbl = cc.replace("_conf_tier_", "").replace("_", " ").title()
+                    vc  = pred_df[cc].value_counts()
+                    for t in ["High", "Medium", "Low"]:
+                        tier_rows.append({"Target": lbl, "Tier": t, "Count": int(vc.get(t, 0))})
+                tier_chart_df = pd.DataFrame(tier_rows)
+                fig_tier = px.bar(
+                    tier_chart_df, x="Target", y="Count", color="Tier",
+                    color_discrete_map={"High": "#01696F", "Medium": "#FFC553", "Low": "#A84B2F"},
+                    barmode="stack",
+                )
+                fig_tier = chart_layout(fig_tier, "Confidence Tier Breakdown by Target",
+                                        "Target", "Rows", height=350)
+                st.plotly_chart(fig_tier, use_container_width=True)
+
+            # Predictions table — only show prediction columns
+            pred_display_cols = [c for c in pred_df.columns
+                                 if not c.startswith("_conf_") and not c.startswith("_pred_")]
+            for slug in ML_TARGETS.values():
+                if f"_pred_{slug}" in pred_df.columns:
+                    pred_display_cols += [f"_pred_{slug}", f"_conf_{slug}", f"_conf_tier_{slug}"]
+            if "_pred_jira_ref" in pred_df.columns:
+                pred_display_cols += ["_pred_jira_ref", "_conf_jira_ref", "_conf_tier_jira_ref"]
+
+            cc_map = {}
+            for slug in ML_TARGETS.values():
+                if f"_conf_{slug}" in pred_df.columns:
+                    cc_map[f"_conf_{slug}"] = st.column_config.ProgressColumn(
+                        f"Conf {slug.replace('_',' ').title()}", min_value=0, max_value=1
+                    )
+
+            disp_cols_present = [c for c in pred_display_cols if c in pred_df.columns]
+            st.dataframe(
+                pred_df[disp_cols_present],
+                use_container_width=True,
+                hide_index=True,
+                column_config=cc_map,
+            )
+            st.download_button(
+                "📥 Download Predictions (CSV)",
+                pred_df[disp_cols_present].to_csv(index=False).encode("utf-8"),
+                file_name="ml_break_predictions.csv",
+                mime="text/csv",
+                key="_dl_pred_csv",
+            )
+
+    st.divider()
+
+    # ── C: Pattern Analysis ───────────────────────────────────────────────────
+    st.subheader("Pattern Analysis")
+    pat1, pat2, pat3, pat4 = st.tabs([
+        "Feature Importance", "Recurring Patterns",
+        "Confidence Distribution", "Category Trends",
+    ])
+
+    with pat1:
+        models_loaded = load_models()
+        if not models_loaded:
+            st.info("Train models to view feature importance.")
+        else:
+            _tgt_sel = st.selectbox(
+                "Select target",
+                [k for k in ML_TARGETS if ML_TARGETS[k] in models_loaded],
+                key="_fi_tgt_sel",
+            )
+            if _tgt_sel:
+                _slug = ML_TARGETS[_tgt_sel]
+                _model = models_loaded[_slug]["model"]
+                _oe_m  = models_loaded[_slug]["oe_meta"]
+                _, _col_meta = _oe_m
+                _feat_names  = _col_meta["cat_cols"] + _col_meta["num_cols"]
+                _importances = _model.feature_importances_
+                if len(_feat_names) == len(_importances):
+                    _fi_df = pd.DataFrame({
+                        "Feature":    _feat_names,
+                        "Importance": _importances,
+                    }).sort_values("Importance", ascending=True).tail(20)
+                    fig_fi = px.bar(
+                        _fi_df, x="Importance", y="Feature", orientation="h",
+                        color_discrete_sequence=[PRIMARY],
+                    )
+                    fig_fi = chart_layout(fig_fi, f"Top Feature Importance — {_tgt_sel}",
+                                         "Importance (gain)", "Feature", height=500)
+                    st.plotly_chart(fig_fi, use_container_width=True)
+
+    with pat2:
+        issue_col  = col_map.get("ISSUE CATEGORY")
+        system_col = col_map.get("System to be Fixed")
+        rec_col    = col_map.get("Rec Name (as per Rec Cube)")
+        if issue_col and system_col and rec_col and all(
+            c in df.columns for c in [issue_col, system_col, rec_col]
+        ):
+            _pat_df = (
+                df[[issue_col, system_col, rec_col]]
+                .dropna(subset=[issue_col, system_col])
+                .groupby([issue_col, system_col])
+                .size()
+                .reset_index(name="Count")
+                .nlargest(30, "Count")
+            )
+            fig_pat = px.density_heatmap(
+                _pat_df, x=system_col, y=issue_col, z="Count",
+                color_continuous_scale="Teal",
+            )
+            fig_pat = chart_layout(fig_pat, "Top Recurring Patterns: Issue Category × System to be Fixed",
+                                   "System to be Fixed", "Issue Category", height=500)
+            st.plotly_chart(fig_pat, use_container_width=True)
+        else:
+            st.info("Requires ISSUE CATEGORY, SYSTEM TO BE FIXED, and Rec Name columns.")
+
+    with pat3:
+        pred_df_c3 = st.session_state.get("_ml_predictions_df")
+        if pred_df_c3 is None:
+            st.info("Run predictions first to view confidence distributions.")
+        else:
+            _conf_num_cols = [c for c in pred_df_c3.columns if c.startswith("_conf_") and "tier" not in c]
+            if _conf_num_cols:
+                _conf_melt = pd.melt(
+                    pred_df_c3[_conf_num_cols],
+                    var_name="Target", value_name="Confidence",
+                )
+                _conf_melt["Target"] = _conf_melt["Target"].str.replace("_conf_", "").str.replace("_", " ").str.title()
+                fig_conf = px.histogram(
+                    _conf_melt, x="Confidence", color="Target", nbins=25,
+                    barmode="overlay", color_discrete_sequence=COLORS, opacity=0.75,
+                )
+                fig_conf = chart_layout(fig_conf, "Confidence Score Distribution by Target",
+                                        "Confidence", "Count", height=400)
+                st.plotly_chart(fig_conf, use_container_width=True)
+            else:
+                st.info("No confidence columns found in predictions.")
+
+    with pat4:
+        _issue_col2 = col_map.get("ISSUE CATEGORY")
+        if _issue_col2 and _issue_col2 in df.columns and "_Period_label" in df.columns:
+            _trend_df = (
+                df[[_issue_col2, "_Period_label"]]
+                .dropna(subset=[_issue_col2])
+                .groupby(["_Period_label", _issue_col2])
+                .size()
+                .reset_index(name="Count")
+            )
+            _top_cats = (
+                _trend_df.groupby(_issue_col2)["Count"].sum()
+                .nlargest(8).index.tolist()
+            )
+            _trend_df = _trend_df[_trend_df[_issue_col2].isin(_top_cats)]
+            fig_cat = px.bar(
+                _trend_df.sort_values("_Period_label"),
+                x="_Period_label", y="Count", color=_issue_col2,
+                barmode="stack", color_discrete_sequence=COLORS,
+            )
+            fig_cat = chart_layout(fig_cat, "Issue Category Breakdown by Period",
+                                   "Period", "Break Count", height=420)
+            st.plotly_chart(fig_cat, use_container_width=True)
+        else:
+            st.info("Requires ISSUE CATEGORY and Period columns.")
+
+    st.divider()
+
+    # ── D: Action Recommendations ─────────────────────────────────────────────
+    st.subheader("Action Recommendations")
+    pred_df_d = st.session_state.get("_ml_predictions_df")
+    if pred_df_d is None:
+        st.info("Run predictions first to generate action recommendations.")
+        return
+
+    _conf_tier_cols = [c for c in pred_df_d.columns if c.startswith("_conf_tier_")]
+    if not _conf_tier_cols:
+        st.info("No prediction confidence columns found.")
+        return
+
+    # Use first target's tier as primary routing signal
+    _primary_tier_col = _conf_tier_cols[0]
+    _tier_dfs = {t: pred_df_d[pred_df_d[_primary_tier_col] == t] for t in ["High", "Medium", "Low"]}
+
+    col_h, col_m, col_l = st.columns(3)
+    for col_ui, tier, color, icon in [
+        (col_h, "High",   "#01696F", "🟢"),
+        (col_m, "Medium", "#FFC553", "🟡"),
+        (col_l, "Low",    "#A84B2F", "🔴"),
+    ]:
+        with col_ui:
+            tier_sub = _tier_dfs[tier]
+            st.metric(f"{icon} {tier} Confidence", f"{len(tier_sub):,} rows",
+                      f"{len(tier_sub)/max(len(pred_df_d),1):.0%} of total")
+            st.caption(ACTION_RECOMMENDATIONS[tier])
+            if len(tier_sub) > 0:
+                _show_cols = [c for c in [
+                    col_map.get("Rec Name (as per Rec Cube)"),
+                    col_map.get("Team"),
+                    col_map.get("Type of break"),
+                    "_pred_issue_category",
+                    "_pred_system_to_be_fixed",
+                    f"_conf_{list(ML_TARGETS.values())[0]}",
+                ] if c and c in tier_sub.columns]
+                st.dataframe(
+                    tier_sub[_show_cols].head(5),
+                    hide_index=True, use_container_width=True,
+                )
+
+    # Excel download with 3 sheets
+    _excel_buf = BytesIO()
+    with pd.ExcelWriter(_excel_buf, engine="openpyxl") as _xw:
+        for tier in ["High", "Medium", "Low"]:
+            _tier_dfs[tier].to_excel(_xw, sheet_name=f"{tier} Confidence", index=False)
+        _summary = pd.DataFrame([
+            {"Tier": t, "Count": len(_tier_dfs[t]),
+             "Pct": f"{len(_tier_dfs[t])/max(len(pred_df_d),1):.1%}",
+             "Action": ACTION_RECOMMENDATIONS[t]}
+            for t in ["High", "Medium", "Low"]
+        ])
+        _summary.to_excel(_xw, sheet_name="Summary", index=False)
+    st.download_button(
+        "📥 Download Action Plan (Excel)",
+        _excel_buf.getvalue(),
+        file_name="ml_action_recommendations.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="_dl_action_excel",
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2803,6 +3797,22 @@ def main():
         if st.button("Clear Cache & Reset Session", key="_clear_cache_btn"):
             n = clear_all_cache()
             st.success(f"Cleared {n} cached file(s). Upload a new file to begin.")
+            st.rerun()
+
+    # ── ML Model Status ──
+    with st.sidebar.expander("🤖 ML Model Status", expanded=False):
+        _meta = _load_ml_meta()
+        if _meta:
+            st.caption(f"Trained: {_meta.get('trained_at', '—')[:10]}")
+            st.caption(f"Rows: {_meta.get('n_rows', 0):,}")
+            for _tgt, _mv in (_meta.get("metrics") or {}).items():
+                if _mv.get("accuracy") is not None:
+                    st.caption(f"{_tgt}: {_mv['accuracy']:.1%}")
+        else:
+            st.caption("No models trained yet. Use the ML Predictions tab.")
+        if HAS_ML and st.button("🗑️ Delete ML Models", key="_ml_delete_btn"):
+            _delete_ml_models()
+            st.success("ML models deleted.")
             st.rerun()
 
     # ── Jira Integration ──
@@ -2905,11 +3915,25 @@ def main():
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
 
+    # ── Stale threshold warning ───────────────────────────────────────────────
+    _thresh_data = load_rec_thresholds()
+    if _thresh_data:
+        _cal_period   = _thresh_data.get("calibrated_at", "")
+        _curr_periods = sorted(df["_Period_label"].dropna().unique().tolist()) if "_Period_label" in df.columns else []
+        _latest_period = _curr_periods[-1] if _curr_periods else ""
+        if _cal_period and _latest_period and str(_cal_period) != str(_latest_period):
+            st.sidebar.warning(
+                f"⚠️ Thresholds calibrated on **{_cal_period}**. "
+                f"New data available (**{_latest_period}**). "
+                "Recalibrate in the **🎯 FP Thresholding** tab."
+            )
+
     # Tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "🧹 Data Quality & Ageing",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
+        "🤖 ML Predictions",
     ])
 
     with tab1:
@@ -2918,6 +3942,8 @@ def main():
         tab_jira_factor_analysis(df_f, col_map, hist_df)
     with tab3:
         tab_fp_thresholding(df_f, col_map, hist_df)
+    with tab4:
+        tab_ml_predictions(df, df_f, col_map, hist_df)
 
 
 if __name__ == "__main__":

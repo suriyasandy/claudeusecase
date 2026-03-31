@@ -11,6 +11,7 @@ the trend views.
 
 ```bash
 pip install -r requirements.txt
+pip install scikit-learn joblib        # required for ML Predictions tab
 streamlit run app.py
 ```
 
@@ -82,6 +83,37 @@ columns. Tick the **Tag for Review** checkbox on any rows and click **Apply Tagg
 Filters** to register them. Then enable **Exclude Confirmed False Positives** in the sidebar
 and click **Apply Filters** to remove those segments from all other tabs — useful for isolating
 genuinely new or anomalous breaks.
+
+#### Adaptive Threshold Calibration (new)
+The **⚙️ Adaptive Threshold Calibration** expander lets you compute per-Rec High/Medium
+thresholds from historical data — a volatile Rec gets wider thresholds, a stable Rec gets
+tighter ones. Click **Calibrate Thresholds from Historical Data** after each monthly upload to
+keep thresholds current. The sidebar shows a warning if thresholds were calibrated on an older
+period. Recs with fewer than 3 historical periods automatically fall back to the global sliders.
+
+### 🤖 ML Predictions (new)
+Trains ML classification models on your labeled historical breaks and predicts outcomes for
+new unlabeled daily break data.
+
+**Predicted outputs:**
+- **Issue Category** and **Issue Category 2** — break classification
+- **System to be Fixed** — which system requires remediation
+- **Jira Reference** — matched via TF-IDF similarity on JIRA Description text
+
+**Confidence tiers:**
+| Tier | Action |
+|---|---|
+| 🟢 High (≥ 75%) | Auto-route to predicted category — flag for confirmation only |
+| 🟡 Medium (50–75%) | Suggest prediction — analyst should verify before routing |
+| 🔴 Low (< 50%) | Manual review required — insufficient historical pattern |
+
+**Workflow:**
+1. Upload your monthly MI file
+2. Go to **🤖 ML Predictions** tab → click **Train Models**
+3. Next month: upload new file → click **Run Predictions** to get predictions with confidence scores
+4. Download the **Action Plan Excel** (3 sheets: High / Medium / Low confidence)
+
+Requires `scikit-learn` and `joblib` — no external NLP or transformer libraries used.
 
 ---
 
